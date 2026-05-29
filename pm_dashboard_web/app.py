@@ -30,24 +30,117 @@ def projects_sorted():
 
 # ─── Custom CSS ──────────────────────────────────────────────────────────
 st.markdown("""<style>
-    [data-testid="stSidebar"] { background: #0f172a; }
-    [data-testid="stSidebar"] * { color: #94a3b8 !important; }
-    [data-testid="stSidebar"] .stRadio label:hover { color: #34d399 !important; }
-    .stMetric { background: white; padding: 12px 16px; border-radius: 8px;
-                border: 1px solid #e2e8f0; }
+    /* ── Sidebar ────────────────────────────────────────────────────── */
+    [data-testid="stSidebar"] {
+        background: #0f172a;
+    }
+    [data-testid="stSidebar"] * {
+        color: #94a3b8 !important;
+    }
+
+    /* Nav button styling */
+    [data-testid="stSidebar"] .stButton > button {
+        background: transparent;
+        border: none;
+        color: #94a3b8 !important;
+        width: 100%;
+        text-align: left;
+        padding: 10px 16px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        margin: 2px 0;
+        transition: all 0.15s;
+        border-left: 3px solid transparent;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background: #1e293b;
+        color: #e2e8f0 !important;
+        border-left-color: #334155;
+    }
+    [data-testid="stSidebar"] .stButton > button:active,
+    [data-testid="stSidebar"] .stButton > button:focus {
+        background: rgba(52, 211, 153, 0.1);
+        color: #34d399 !important;
+        border-left-color: #34d399;
+    }
+
+    /* KPI cards */
+    .stMetric {
+        background: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+    }
     div[data-testid="stMetricValue"] { font-size: 28px; }
+
+    /* Hide default radio buttons */
+    [data-testid="stSidebar"] .stRadio { display: none; }
 </style>""", unsafe_allow_html=True)
 
 # ─── Sidebar navigation ─────────────────────────────────────────────────
+NAV_ITEMS = [
+    ("📊", "Overview"),
+    ("📁", "Project View"),
+    ("📋", "Master View"),
+    ("📈", "Actual vs Budget"),
+    ("🎓", "Credits"),
+    ("📄", "Invoices / WO"),
+    ("⏱️", "Hours"),
+    ("🛠️", "Tools"),
+]
+
+if "page" not in st.session_state:
+    st.session_state.page = "Overview"
+
 with st.sidebar:
-    st.markdown("### 🟢 PM Dashboard")
-    st.caption("Project Intelligence")
-    st.divider()
-    page = st.radio("Navigation", [
-        "Overview", "Project View", "Master View",
-        "Actual vs Budget", "Credits",
-        "Invoices / WO", "Hours", "Tools"
-    ], label_visibility="collapsed")
+    # Logo
+    st.markdown("""
+    <div style="padding: 8px 0 16px;">
+        <div style="font-size: 14px; font-weight: 600; color: #34d399 !important;
+                    letter-spacing: 0.03em;">PM DASHBOARD</div>
+        <div style="font-size: 11px; color: #475569 !important; margin-top: 2px;">
+            Project Intelligence</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; margin: 0 0 12px;">', 
+                unsafe_allow_html=True)
+
+    st.markdown('<div style="font-size: 10px; font-weight: 500; color: #334155 !important; '
+                'letter-spacing: 0.08em; padding: 0 4px; margin-bottom: 6px;">MAIN</div>',
+                unsafe_allow_html=True)
+
+    for icon, label in NAV_ITEMS:
+        is_active = st.session_state.page == label
+        # Active state styling via markdown + button combo
+        if is_active:
+            st.markdown(
+                f'<div style="background: rgba(52,211,153,0.1); border-radius: 8px; '
+                f'border-left: 3px solid #34d399; padding: 10px 16px; margin: 2px 0; '
+                f'font-size: 14px; font-weight: 500; color: #34d399 !important; '
+                f'cursor: default;">{icon}  {label}</div>',
+                unsafe_allow_html=True)
+        else:
+            if st.button(f"{icon}  {label}", key=f"nav_{label}",
+                         use_container_width=True):
+                st.session_state.page = label
+                st.rerun()
+
+    # Footer
+    st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; '
+                'margin: 16px 0 12px;">', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
+        <div style="width: 28px; height: 28px; border-radius: 50%;
+                    background: rgba(52,211,153,0.15); display: flex;
+                    align-items: center; justify-content: center;
+                    font-size: 11px; font-weight: 500; color: #34d399 !important;">PM</div>
+        <span style="font-size: 12px; color: #475569 !important;">Project Manager</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+page = st.session_state.page
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -546,9 +639,9 @@ elif page == "Invoices / WO":
             })
         st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
 
-        # Toggle sent/paid
-        st.subheader("Quick Toggle")
-        tg_c = st.columns(3)
+        # Toggle sent/paid and Delete
+        st.subheader("Quick Actions")
+        tg_c = st.columns(4)
         tg_idx = tg_c[0].number_input("Row # (1-based)", min_value=1,
                                         max_value=len(flat), value=1)
         tg_field = tg_c[1].selectbox("Toggle", ["sent", "paid"])
@@ -558,6 +651,20 @@ elif page == "Invoices / WO":
                 r["_inst"][tg_field] = not r["_inst"][tg_field]
             else:
                 r["_rec"][tg_field] = not r["_rec"][tg_field]
+            save()
+            st.rerun()
+        if tg_c[3].button("🗑️ Delete Row"):
+            r = flat[tg_idx - 1]
+            rec = r["_rec"]
+            if r["_inst"] is not None:
+                # WO installment — remove just this installment
+                rec.get("installments", []).remove(r["_inst"])
+                # If no installments left, remove the whole WO
+                if not rec.get("installments"):
+                    D()["invoices"].remove(rec)
+            else:
+                # Invoice — remove the whole record
+                D()["invoices"].remove(rec)
             save()
             st.rerun()
 
