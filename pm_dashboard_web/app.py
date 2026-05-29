@@ -224,20 +224,20 @@ elif page == "Project View":
         fc = st.columns(4)
         new_name = fc[0].text_input("Name", value=row[0])
         new_stu = fc[1].number_input("Students", value=int(row[1]), min_value=0)
-        new_sr = fc[2].number_input("Stu Rate", value=float(row[2]), min_value=0.0, format="%.2f")
-        new_sh = fc[3].number_input("Stu Hours", value=float(row[3]), min_value=0.0, format="%.1f")
+        new_sr = fc[2].number_input("Stu Rate", value=float(row[2]), min_value=0.0, step=1.0, format="%.2f")
+        new_sh = fc[3].number_input("Stu Hours", value=float(row[3]), min_value=0.0, step=0.5, format="%.1f")
         fc2 = st.columns(4)
-        new_pr = fc2[0].number_input("PI Rate", value=float(row[4]), min_value=0.0, format="%.2f")
-        new_ph = fc2[1].number_input("PI Hours", value=float(row[5]), min_value=0.0, format="%.1f")
-        new_ind = fc2[2].number_input("Indirect", value=float(row[6]), min_value=0.0, format="%.2f")
-        new_fri = fc2[3].number_input("Fringe", value=float(row[7]), min_value=0.0, format="%.2f")
+        new_pr = fc2[0].number_input("PI Rate", value=float(row[4]), min_value=0.0, step=1.0, format="%.2f")
+        new_ph = fc2[1].number_input("PI Hours", value=float(row[5]), min_value=0.0, step=0.5, format="%.1f")
+        new_ind = fc2[2].number_input("Indirect", value=float(row[6]), min_value=0.0, step=1.0, format="%.2f")
+        new_fri = fc2[3].number_input("Fringe", value=float(row[7]), min_value=0.0, step=1.0, format="%.2f")
         fc3 = st.columns(4)
-        new_trv = fc3[0].number_input("Travel", value=float(row[8]), min_value=0.0, format="%.2f")
-        new_cp = fc3[1].number_input("Cont. Personnel", value=float(row[9]), min_value=0.0, format="%.2f")
-        new_cpi = fc3[2].number_input("Cont. PI", value=float(row[10]), min_value=0.0, format="%.2f")
-        new_ci = fc3[3].number_input("Cont. Indirect", value=float(row[11]), min_value=0.0, format="%.2f")
+        new_trv = fc3[0].number_input("Travel", value=float(row[8]), min_value=0.0, step=1.0, format="%.2f")
+        new_cp = fc3[1].number_input("Cont. Personnel", value=float(row[9]), min_value=0.0, step=1.0, format="%.2f")
+        new_cpi = fc3[2].number_input("Cont. PI", value=float(row[10]), min_value=0.0, step=1.0, format="%.2f")
+        new_ci = fc3[3].number_input("Cont. Indirect", value=float(row[11]), min_value=0.0, step=1.0, format="%.2f")
         fc4 = st.columns(4)
-        new_cf = fc4[0].number_input("Cont. Fringe", value=float(row[12]), min_value=0.0, format="%.2f")
+        new_cf = fc4[0].number_input("Cont. Fringe", value=float(row[12]), min_value=0.0, step=1.0, format="%.2f")
 
         if st.form_submit_button("💾 Save Changes"):
             row[0] = new_name
@@ -456,10 +456,10 @@ elif page == "Invoices / WO":
 
         if inv_type == "Invoice":
             ic2 = st.columns(4)
-            amt = ic2[0].number_input("Amount ($)", value=0.0, format="%.2f")
+            amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f")
             net = ic2[1].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"])
             due = ic2[2].date_input("Due Date", value=None, key="inv_due")
-            hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, format="%.1f")
+            hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, step=0.5, format="%.1f")
             ic3 = st.columns(2)
             sent = ic3[0].checkbox("Sent", key="inv_sent")
             paid = ic3[1].checkbox("Paid", key="inv_paid")
@@ -484,7 +484,7 @@ elif page == "Invoices / WO":
                 st.session_state.wo_installments = []
             ic2 = st.columns(4)
             period = ic2[0].text_input("Period / Label")
-            inst_amt = ic2[1].number_input("Amount ($)", value=0.0, format="%.2f", key="inst_amt")
+            inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="inst_amt")
             inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="inst_net")
             inst_due = ic2[3].date_input("Due Date", value=None, key="inst_due")
             add_inst = st.form_submit_button("➕ Add Installment")
@@ -586,7 +586,7 @@ elif page == "Hours":
 
     with hc2:
         new_budget = st.number_input("Annual Hours Budget", value=budget,
-                                      min_value=0.0, format="%.1f")
+                                      min_value=0.0, step=1.0, format="%.1f")
         if st.button("Set Budget"):
             proj["hours_budget"] = new_budget
             save()
@@ -603,7 +603,7 @@ elif page == "Hours":
     with col_l:
         with st.form("deduct_hrs"):
             st.subheader("Deduct Hours")
-            hrs = st.number_input("Hours", min_value=0.1, value=1.0, format="%.1f")
+            hrs = st.number_input("Hours", min_value=0.1, value=1.0, step=0.5, format="%.1f")
             desc = st.text_input("Description")
             dt = st.date_input("Date", value=date.today())
             if st.form_submit_button("Deduct"):
@@ -661,7 +661,7 @@ elif page == "Tools":
         tc = st.columns(3)
         t_name = tc[0].text_input("Tool Name")
         t_vendor = tc[1].text_input("Vendor")
-        t_cost = tc[2].number_input("Cost ($)", value=0.0, format="%.2f")
+        t_cost = tc[2].number_input("Cost ($)", value=0.0, step=1.0, format="%.2f")
         tc2 = st.columns(4)
         t_cycle = tc2[0].selectbox("Billing Cycle",
                                     ["Monthly", "Annual", "2-Year", "One-time"])
