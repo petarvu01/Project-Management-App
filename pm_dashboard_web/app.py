@@ -2,13 +2,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
 from datetime import date
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
-                  get_fy_options, project_in_fy, project_hours_summary)
+                  get_fy_options, project_in_fy, project_hours_summary,
+                  count_tool_users, tool_share_costs, gist_configured,
+                  tool_users, tool_alloc_for, tool_has_custom_split,
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -235,6 +239,18 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    # Storage status + manual backup
+    if gist_configured():
+        st.caption("💾 Cloud storage: on (Gist)")
+    else:
+        st.caption("⚠️ Local only — data resets on redeploy")
+    st.download_button(
+        "⬇️ Download backup (JSON)",
+        json.dumps(st.session_state.data, indent=2),
+        "dashboard_progress.json", "application/json",
+        use_container_width=True, key="sidebar_backup",
+    )
+
 page = st.session_state.page
 
 
@@ -243,13 +259,40 @@ page = st.session_state.page
 # ═════════════════════════════════════════════════════════════════════════
 if page == "Overview":
     st.title("📊 Overview")
-    totals = compute_master_totals(D())
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active Projects", totals["active_projects"])
-    c2.metric("Student Credits", totals["total_credits"])
-    c3.metric("Total Budget", f"${totals['total_budget']:,.2f}")
-    c4.metric("Personnel Cost", f"${totals['total_stu_personnel']:,.2f}")
+    # ── Configurable KPI board (shared — saved in the data file) ─────────
+    selected_kpis = [k for k in D().get("overview_kpis", DEFAULT_KPIS) if k in KPI_LABELS]
+    if not selected_kpis:
+        selected_kpis = list(DEFAULT_KPIS)
+    kpi_values = compute_kpis(D())
+
+    for start in range(0, len(selected_kpis), 4):
+        chunk = selected_kpis[start:start + 4]
+        cols = st.columns(4)
+        for col, key in zip(cols, chunk):
+            col.metric(KPI_LABELS[key], kpi_values.get(key, "—"))
+
+    with st.expander("⚙️ Customize KPIs"):
+        st.caption("Pick which metrics show on the Overview. The selection is saved "
+                   "with the shared data, so everyone sees the same board.")
+        all_labels = [label for _, label in KPI_OPTIONS]
+        label_to_key = {label: key for key, label in KPI_OPTIONS}
+        current_labels = [KPI_LABELS[k] for k in selected_kpis]
+        picked = st.multiselect("Visible KPIs (shown in this order)", all_labels,
+                                default=current_labels, key="kpi_picker")
+        kc1, kc2 = st.columns([1, 1])
+        if kc1.button("💾 Save KPIs"):
+            if picked:
+                D()["overview_kpis"] = [label_to_key[l] for l in picked]
+                save()
+                st.toast("KPI board saved")
+                st.rerun()
+            else:
+                st.error("Pick at least one KPI.")
+        if kc2.button("↩️ Reset to default"):
+            D()["overview_kpis"] = list(DEFAULT_KPIS)
+            save()
+            st.rerun()
 
     col_left, col_right = st.columns([2, 3])
 
@@ -511,18 +554,34 @@ elif page == "Project View":
             st.rerun()
     if assigned:
         tool_data = []
-        total_m = total_a = 0.0
+        total_m_share = total_a_share = 0.0
         for tn in assigned:
             t = next((t for t in D()["tools"] if t.get("name") == tn), None)
             if t:
-                mc, ac = calc_tool_costs(t)
-                total_m += mc; total_a += ac
-                tool_data.append({"Tool": tn, "Vendor": t.get("vendor", ""),
-                                  "Monthly": f"${mc:,.2f}", "Annual": f"${ac:,.2f}"})
+                full_mc, full_ac = calc_tool_costs(t)
+                share_mc, share_ac = tool_share_costs(D(), t, active)
+                n_users = count_tool_users(D(), tn)
+                frac = tool_alloc_for(D(), t, active)
+                split_label = (f"{n_users} project{'s' if n_users != 1 else ''}"
+                               + (" (custom)" if tool_has_custom_split(D(), t) else ""))
+                total_m_share += share_mc; total_a_share += share_ac
+                tool_data.append({
+                    "Tool": tn, "Vendor": t.get("vendor", ""),
+                    "Full Annual": f"${full_ac:,.2f}",
+                    "Split among": split_label,
+                    "Share %": f"{frac * 100:.0f}%",
+                    "Your share / mo": f"${share_mc:,.2f}",
+                    "Your share / yr": f"${share_ac:,.2f}",
+                })
             else:
-                tool_data.append({"Tool": tn, "Vendor": "—", "Monthly": "—", "Annual": "—"})
+                tool_data.append({"Tool": tn, "Vendor": "—",
+                                  "Full Annual": "—", "Split among": "—", "Share %": "—",
+                                  "Your share / mo": "—", "Your share / yr": "—"})
         st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
-        st.markdown(f"**Total: ${total_m:,.2f}/mo · ${total_a:,.2f}/yr**")
+        st.markdown(f"**This project's share: ${total_m_share:,.2f}/mo · "
+                    f"${total_a_share:,.2f}/yr**")
+        st.caption("Shared tools split equally by default; set a custom split per tool "
+                   "on the Tools tab.")
         rem_tool = st.selectbox("Remove tool", assigned, key="rem_tool")
         if st.button("Remove Tool"):
             assigned.remove(rem_tool)
@@ -622,8 +681,8 @@ elif page == "Actual vs Budget":
         for tn in proj.get("assigned_tools", []):
             t = next((x for x in D()["tools"] if x.get("name") == tn), None)
             if t:
-                _, annual_cost = calc_tool_costs(t)
-                tools_actual += annual_cost
+                _, annual_share = tool_share_costs(D(), t, name)
+                tools_actual += annual_share
 
         budget = cont_personnel + cont_pi + cont_indirect + cont_fringe + cont_travel
         actuals = pers + pi + trv + tools_actual
@@ -726,7 +785,7 @@ elif page == "Credits":
             on_select="rerun", selection_mode="single-row", key="credits_table",
         )
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(credits):
             i = sel[0]
             st.caption(f"Selected: **{credits[i]['name']}** ({credits[i]['student_id']})")
             if st.button("🗑️ Remove Student"):
@@ -1026,7 +1085,7 @@ elif page == "Invoices / WO":
         # Quick actions on the selected row (click a row above)
         st.subheader("Quick Actions")
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(flat):
             r = flat[sel[0]]
             st.caption(f"Selected: {r['type']} #{r['number']} — {r['project']} — ${r['inst_amount']:,.2f}")
             qc1, qc2, qc3 = st.columns([1, 1, 1])
@@ -1153,6 +1212,13 @@ elif page == "Tools":
         for t in tools:
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
+            n_users = count_tool_users(D(), t.get("name", ""))
+            if n_users <= 0:
+                per_proj = "—"
+            elif tool_has_custom_split(D(), t):
+                per_proj = "custom"
+            else:
+                per_proj = f"${ac / n_users:,.2f}"
             tool_data.append({
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
@@ -1160,6 +1226,8 @@ elif page == "Tools":
                 "Cycle": t.get("billing_cycle", ""),
                 "Monthly": f"${mc:,.2f}",
                 "Annual": f"${ac:,.2f}",
+                "Used by": f"{n_users}" if n_users else "—",
+                "Per project / yr": per_proj,
                 "Start": fmt_date(t.get("start_date", "")),
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
                 "Auto": "Yes" if t.get("auto_renew") else "No",
@@ -1173,7 +1241,7 @@ elif page == "Tools":
 
         # Toggle paid / Delete on the selected row
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(tools):
             i = sel[0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
@@ -1185,8 +1253,61 @@ elif page == "Tools":
                 tools.pop(i)
                 save()
                 st.rerun()
+
+            # ── Cost split editor (only meaningful when 2+ projects share it) ──
+            t_sel = tools[i]
+            users = tool_users(D(), t_sel.get("name", ""))
+            if len(users) >= 2:
+                _, full_annual = calc_tool_costs(t_sel)
+                st.markdown("**Cost split across projects**")
+                st.caption(f"Full annual cost ${full_annual:,.2f}. Enter each project's "
+                           "percent — equal split is used until you save a custom one. "
+                           "If the percents don't sum to 100, shares are scaled "
+                           "proportionally.")
+                alloc = t_sel.get("allocations") or {}
+                equal_pct = round(100.0 / len(users), 2)
+                pct_inputs = {}
+                cols = st.columns(min(len(users), 4))
+                for j, p in enumerate(users):
+                    default_pct = float(alloc.get(p, equal_pct) or equal_pct)
+                    with cols[j % len(cols)]:
+                        pct_inputs[p] = st.number_input(
+                            f"{p} %", min_value=0.0, max_value=100.0,
+                            value=default_pct, step=5.0, format="%.1f",
+                            key=f"alloc_{i}_{p}",
+                        )
+                total_pct = sum(pct_inputs.values())
+                if abs(total_pct - 100.0) > 0.01:
+                    st.warning(f"Percents sum to {total_pct:.1f}% — shares will be "
+                               "scaled proportionally on save.")
+                else:
+                    st.caption(f"✓ Sums to {total_pct:.0f}%")
+                sc1, sc2 = st.columns(2)
+                if sc1.button("💾 Save Split", key=f"save_split_{i}"):
+                    if total_pct <= 0:
+                        st.error("At least one project needs a percent above 0.")
+                    else:
+                        t_sel["allocations"] = {p: float(v) for p, v in pct_inputs.items()}
+                        save()
+                        st.toast("Custom split saved")
+                        st.rerun()
+                if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
+                    t_sel["allocations"] = {}
+                    save()
+                    st.rerun()
+                # Preview of resulting dollar shares
+                if total_pct > 0:
+                    preview = [{"Project": p,
+                                "Share": f"{(v / total_pct) * 100:.1f}%",
+                                "$ / yr": f"${full_annual * v / total_pct:,.2f}"}
+                               for p, v in pct_inputs.items()]
+                    st.dataframe(pd.DataFrame(preview), use_container_width=True,
+                                 hide_index=True)
+            elif len(users) == 1:
+                st.caption(f"Only **{users[0]}** uses this tool — it bears the full cost. "
+                           "Assign the tool to more projects to split it.")
         else:
-            st.caption("Click a row above to toggle Paid or delete a tool.")
+            st.caption("Click a row above to toggle Paid, delete, or set a cost split.")
 
 
 # ═════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,6 @@
 """Data management — load, save, compute totals, notifications."""
 import json
+import os
 import shutil
 from datetime import date, datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      fy_range, calc_payment_due, calc_renewal_date, calc_tool_costs)
 
 DATA_FILE = Path(__file__).parent / "dashboard_progress.json"
+GIST_FILENAME = "dashboard_progress.json"
 MAX_BACKUPS = 10
 
 # ─── Default project template ────────────────────────────────────────────
@@ -95,41 +97,153 @@ def default_data():
     }
 
 
-def load_data() -> dict:
+# ─── GitHub Gist storage (durable, survives Streamlit redeploys) ──────────
+def _gist_config():
+    """Return (token, gist_id) from Streamlit secrets or env vars; (None, None) if unset."""
+    token = gist_id = None
+    try:
+        import streamlit as st
+        if "github" in st.secrets:
+            token = st.secrets["github"].get("token")
+            gist_id = st.secrets["github"].get("gist_id")
+    except Exception:
+        pass
+    token = token or os.environ.get("GITHUB_TOKEN")
+    gist_id = gist_id or os.environ.get("GIST_ID")
+    return token, gist_id
+
+
+def gist_configured() -> bool:
+    token, gist_id = _gist_config()
+    return bool(token and gist_id)
+
+
+def _load_from_gist():
+    """Return parsed dict from the gist, or None if not configured / unreachable.
+    An empty gist returns {} (distinct from None) so callers can seed it safely."""
+    token, gist_id = _gist_config()
+    if not token or not gist_id:
+        return None
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        files = r.json().get("files", {})
+        f = files.get(GIST_FILENAME)
+        if not f:
+            return {}
+        content = f.get("content", "")
+        if f.get("truncated") and f.get("raw_url"):
+            content = requests.get(f["raw_url"], timeout=10).text
+        content = (content or "").strip()
+        if not content:
+            return {}
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def _save_to_gist(data: dict) -> bool:
+    token, gist_id = _gist_config()
+    if not token or not gist_id:
+        return False
+    try:
+        import requests
+        payload = {"files": {GIST_FILENAME: {"content": json.dumps(data, indent=4)}}}
+        r = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github+json"},
+            json=payload, timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _read_local():
+    """Raw read of the local cache file, or None."""
     if not DATA_FILE.exists():
-        return default_data()
+        return None
     try:
         with DATA_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        pr = data.get("project_records", {})
-        for proj in pr.values():
-            for key, default in [("notes",""), ("start_date",""), ("end_date",""),
-                                  ("extension_date",""), ("hours_budget",0.0),
-                                  ("hours_log",[]), ("assigned_tools",[])]:
-                proj.setdefault(key, default)
-            # Migrate old Hours-tab project-level budget into the new contracted_hours
-            # field so existing data carries over the first time the new app opens it.
-            if "contracted_hours" not in proj:
-                proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
-            proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
-            if not proj["lines"]:
-                proj["lines"] = [blank_line()]
-        data["project_records"] = pr
-        data.setdefault("student_credits", [])
-        data.setdefault("invoices", [])
-        data.setdefault("tools", [])
-        return data
+            return json.load(f)
     except Exception:
-        return default_data()
+        return None
 
 
-def save_data(data: dict):
+def _write_local(data: dict):
     try:
         with DATA_FILE.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
-        _auto_backup()
     except OSError:
         pass
+
+
+def _normalize(data: dict) -> dict:
+    """Apply field defaults and per-line migrations to a loaded data dict."""
+    pr = data.get("project_records", {})
+    for proj in pr.values():
+        for key, default in [("notes",""), ("start_date",""), ("end_date",""),
+                              ("extension_date",""), ("hours_budget",0.0),
+                              ("hours_log",[]), ("assigned_tools",[])]:
+            proj.setdefault(key, default)
+        # Migrate old Hours-tab project-level budget into the new contracted_hours field.
+        if "contracted_hours" not in proj:
+            proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
+        proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
+        if not proj["lines"]:
+            proj["lines"] = [blank_line()]
+    data["project_records"] = pr
+    data.setdefault("student_credits", [])
+    data.setdefault("invoices", [])
+    data.setdefault("tools", [])
+    for t in data["tools"]:
+        if isinstance(t, dict):
+            t.setdefault("allocations", {})
+    data.setdefault("overview_kpis", list(DEFAULT_KPIS))
+    return data
+
+
+def load_data() -> dict:
+    # 1. Prefer the gist (the durable source of truth on Streamlit Cloud).
+    gist_data = _load_from_gist()
+    if gist_data is not None:
+        if gist_data:  # gist has real content
+            data = _normalize(gist_data)
+            _write_local(data)      # refresh local cache
+            return data
+        # Gist is configured but EMPTY → seed it from local cache or defaults (once).
+        seed = _normalize(_read_local() or default_data())
+        _save_to_gist(seed)
+        _write_local(seed)
+        return seed
+    # 2. Gist not configured or unreachable → use local cache, never overwrite the gist.
+    local = _read_local()
+    if local is not None:
+        try:
+            return _normalize(local)
+        except Exception:
+            return default_data()
+    # 3. Nothing anywhere yet → defaults.
+    return default_data()
+
+
+def save_data(data: dict):
+    # Always write the local cache (fast, and a fallback if the gist is briefly down).
+    _write_local(data)
+    try:
+        _auto_backup()
+    except Exception:
+        pass
+    # Push to the durable gist store.
+    _save_to_gist(data)
 
 
 def _auto_backup():
@@ -193,6 +307,80 @@ def project_hours_summary(proj: dict):
         except (TypeError, ValueError):
             pass
     return budget, deducted
+
+
+def count_tool_users(data: dict, tool_name: str) -> int:
+    """Number of projects that have this tool in their assigned_tools list."""
+    if not tool_name:
+        return 0
+    return sum(1 for proj in data.get("project_records", {}).values()
+               if tool_name in proj.get("assigned_tools", []))
+
+
+def tool_users(data: dict, tool_name: str) -> list:
+    """Sorted list of project names that have this tool assigned."""
+    if not tool_name:
+        return []
+    return sorted(name for name, proj in data.get("project_records", {}).items()
+                  if tool_name in proj.get("assigned_tools", []))
+
+
+def tool_alloc_for(data: dict, tool: dict, project_name: str) -> float:
+    """Fraction (0–1) of this tool's cost attributed to project_name.
+
+    If the tool has a custom 'allocations' dict ({project: percent}), shares are
+    proportional to the percents of currently-assigned projects (so they still
+    work even if the percents don't sum to exactly 100, or a project was
+    unassigned after the split was saved). Falls back to an equal split when no
+    valid custom allocation exists."""
+    users = tool_users(data, tool.get("name", ""))
+    if project_name not in users:
+        return 0.0
+    alloc = tool.get("allocations") or {}
+    valid = {}
+    for p in users:
+        try:
+            v = float(alloc.get(p, 0))
+            if v > 0:
+                valid[p] = v
+        except (TypeError, ValueError):
+            pass
+    total = sum(valid.values())
+    if total > 0:
+        return valid.get(project_name, 0.0) / total
+    return 1.0 / len(users)
+
+
+def tool_has_custom_split(data: dict, tool: dict) -> bool:
+    """True if the tool has a usable custom allocation over its current users."""
+    users = tool_users(data, tool.get("name", ""))
+    alloc = tool.get("allocations") or {}
+    total = 0.0
+    for p in users:
+        try:
+            v = float(alloc.get(p, 0))
+            if v > 0:
+                total += v
+        except (TypeError, ValueError):
+            pass
+    return total > 0
+
+
+def tool_share_costs(data: dict, tool: dict, project_name: str = None):
+    """Return (monthly_share, annual_share) of this tool's cost.
+
+    With project_name: that project's share (custom allocation if set, else equal).
+    Without:           the equal per-project share (legacy behavior).
+    (0, 0) if no projects use the tool."""
+    from helpers import calc_tool_costs  # local import to avoid cycle
+    users = tool_users(data, tool.get("name", ""))
+    if not users:
+        return 0.0, 0.0
+    monthly, annual = calc_tool_costs(tool)
+    if project_name is None:
+        return monthly / len(users), annual / len(users)
+    frac = tool_alloc_for(data, tool, project_name)
+    return monthly * frac, annual * frac
 
 
 def wo_project_total(data: dict, proj_name: str) -> float:
@@ -344,3 +532,86 @@ def project_in_fy(proj: dict, label: str) -> bool:
     if p_end:
         return fy_s <= p_end <= fy_e
     return False
+
+
+# ─── Overview KPIs (predefined, user-selectable) ──────────────────────────
+# Ordered (key, label) pairs — this is the menu users pick from.
+KPI_OPTIONS = [
+    ("active_projects",     "Active Projects"),
+    ("total_credits",       "Student Credits"),
+    ("total_budget",        "Total Budget"),
+    ("total_stu_personnel", "Personnel Cost"),
+    ("total_pi_cost",       "PI Cost"),
+    ("total_actuals",       "Total Actuals"),
+    ("total_cont_hours",    "Contracted Hours"),
+    ("total_hours_deducted","Hours Deducted"),
+    ("hours_remaining",     "Hours Remaining"),
+    ("unpaid_count",        "Unpaid Invoices"),
+    ("unpaid_amount",       "Unpaid Amount"),
+    ("overdue_count",       "Overdue Payments"),
+    ("tools_count",         "Tools"),
+    ("tools_annual",        "Tool Cost / yr"),
+    ("students_count",      "Student Workers (Credits tab)"),
+]
+DEFAULT_KPIS = ["active_projects", "total_credits", "total_budget", "total_stu_personnel"]
+KPI_LABELS = dict(KPI_OPTIONS)
+
+
+def compute_kpis(data: dict) -> dict:
+    """Compute every predefined KPI. Returns {key: formatted_value_string}."""
+    totals = compute_master_totals(data)
+    pr = data.get("project_records", {})
+
+    # Actuals = personnel + PI + actual travel + each project's tool share
+    actuals = 0.0
+    for name, proj in pr.items():
+        for r in proj.get("lines", []):
+            try:
+                actuals += int(r[1]) * float(r[2]) * float(r[3])   # student personnel
+                actuals += float(r[4]) * float(r[5])               # PI
+                actuals += float(r[8])                             # actual travel
+            except (TypeError, ValueError, IndexError):
+                pass
+        for tn in proj.get("assigned_tools", []):
+            t = next((x for x in data.get("tools", []) if x.get("name") == tn), None)
+            if t:
+                _, a = tool_share_costs(data, t, name)
+                actuals += a
+
+    cont_hours = sum(float(p.get("contracted_hours", 0) or 0) for p in pr.values())
+    hours_deducted = sum(project_hours_summary(p)[1] for p in pr.values()
+                         if float(p.get("contracted_hours", 0) or 0) > 0)
+
+    rows = flat_invoice_rows(data)
+    unpaid = [r for r in rows if not r["paid"]]
+    unpaid_amount = sum(r["inst_amount"] for r in unpaid)
+    today = date.today()
+    overdue = 0
+    for r in unpaid:
+        d = parse_date(r["payment_due"]) or parse_date(r["due_date"])
+        if d and d < today:
+            overdue += 1
+
+    tools = data.get("tools", [])
+    tools_annual = 0.0
+    for t in tools:
+        _, a = calc_tool_costs(t)
+        tools_annual += a
+
+    return {
+        "active_projects":      f"{totals['active_projects']}",
+        "total_credits":        f"{totals['total_credits']}",
+        "total_budget":         f"${totals['total_budget']:,.2f}",
+        "total_stu_personnel":  f"${totals['total_stu_personnel']:,.2f}",
+        "total_pi_cost":        f"${totals['total_pi_cost']:,.2f}",
+        "total_actuals":        f"${actuals:,.2f}",
+        "total_cont_hours":     f"{cont_hours:,.0f} hrs",
+        "total_hours_deducted": f"{hours_deducted:,.0f} hrs",
+        "hours_remaining":      f"{cont_hours - hours_deducted:,.0f} hrs",
+        "unpaid_count":         f"{len(unpaid)}",
+        "unpaid_amount":        f"${unpaid_amount:,.2f}",
+        "overdue_count":        f"{overdue}",
+        "tools_count":          f"{len(tools)}",
+        "tools_annual":         f"${tools_annual:,.2f}",
+        "students_count":       f"{len(data.get('student_credits', []))}",
+    }
