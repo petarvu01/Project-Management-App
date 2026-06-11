@@ -206,7 +206,20 @@ def _normalize(data: dict) -> dict:
     data.setdefault("tools", [])
     for t in data["tools"]:
         if isinstance(t, dict):
-            t.setdefault("allocations", {})
+            t.setdefault("split_amounts", {})
+            # Migrate the earlier percent-based 'allocations' to dollar amounts
+            # (percent of the billing-cycle cost), then drop the old field.
+            old = t.pop("allocations", None)
+            if old and not t["split_amounts"]:
+                try:
+                    valid = {p: float(v) for p, v in old.items() if float(v) > 0}
+                    total = sum(valid.values())
+                    cost = float(t.get("cost", 0))
+                    if total > 0 and cost > 0:
+                        t["split_amounts"] = {p: round(cost * v / total, 2)
+                                              for p, v in valid.items()}
+                except (TypeError, ValueError):
+                    pass
     data.setdefault("overview_kpis", list(DEFAULT_KPIS))
     return data
 
@@ -325,62 +338,93 @@ def tool_users(data: dict, tool_name: str) -> list:
                   if tool_name in proj.get("assigned_tools", []))
 
 
-def tool_alloc_for(data: dict, tool: dict, project_name: str) -> float:
-    """Fraction (0–1) of this tool's cost attributed to project_name.
-
-    If the tool has a custom 'allocations' dict ({project: percent}), shares are
-    proportional to the percents of currently-assigned projects (so they still
-    work even if the percents don't sum to exactly 100, or a project was
-    unassigned after the split was saved). Falls back to an equal split when no
-    valid custom allocation exists."""
+def tool_split_amounts(data: dict, tool: dict) -> dict:
+    """Custom dollar split over the tool's CURRENT users, in billing-cycle units
+    ({project: dollars}). Entries for unassigned projects are ignored.
+    Returns {} when no custom split is set (→ equal split applies)."""
     users = tool_users(data, tool.get("name", ""))
-    if project_name not in users:
-        return 0.0
-    alloc = tool.get("allocations") or {}
-    valid = {}
+    sa = tool.get("split_amounts") or {}
+    out = {}
     for p in users:
         try:
-            v = float(alloc.get(p, 0))
+            v = float(sa.get(p, 0))
             if v > 0:
-                valid[p] = v
+                out[p] = v
         except (TypeError, ValueError):
             pass
-    total = sum(valid.values())
-    if total > 0:
-        return valid.get(project_name, 0.0) / total
-    return 1.0 / len(users)
+    return out
 
 
 def tool_has_custom_split(data: dict, tool: dict) -> bool:
-    """True if the tool has a usable custom allocation over its current users."""
+    """True if the tool has at least one positive custom dollar amount
+    for a currently-assigned project."""
+    return bool(tool_split_amounts(data, tool))
+
+
+def tool_split_for(data: dict, tool: dict, project_name: str) -> float:
+    """This project's dollar share of the tool, in billing-cycle units.
+
+    Literal semantics: with a custom split, each project gets exactly the
+    amount entered for it (projects without an entry get 0). Without a custom
+    split, the tool's cost divides equally among its users."""
     users = tool_users(data, tool.get("name", ""))
-    alloc = tool.get("allocations") or {}
-    total = 0.0
-    for p in users:
-        try:
-            v = float(alloc.get(p, 0))
-            if v > 0:
-                total += v
-        except (TypeError, ValueError):
-            pass
-    return total > 0
+    if project_name not in users:
+        return 0.0
+    custom = tool_split_amounts(data, tool)
+    if custom:
+        return custom.get(project_name, 0.0)
+    try:
+        cost = float(tool.get("cost", 0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    return cost / len(users)
+
+
+def _cycle_amount_to_monthly_annual(amount: float, cycle: str):
+    """Convert a billing-cycle dollar amount to (monthly, annual) — mirrors
+    calc_tool_costs' conversion."""
+    if cycle == "Monthly":
+        return amount, amount * 12
+    if cycle == "Annual":
+        return round(amount / 12, 2), amount
+    if cycle == "2-Year":
+        return round(amount / 24, 2), round(amount / 2, 2)
+    return 0.0, 0.0  # One-time / unknown
 
 
 def tool_share_costs(data: dict, tool: dict, project_name: str = None):
     """Return (monthly_share, annual_share) of this tool's cost.
 
-    With project_name: that project's share (custom allocation if set, else equal).
-    Without:           the equal per-project share (legacy behavior).
+    With project_name: that project's share (literal custom $ if set, else equal).
+    Without:           the equal per-project share.
     (0, 0) if no projects use the tool."""
-    from helpers import calc_tool_costs  # local import to avoid cycle
     users = tool_users(data, tool.get("name", ""))
     if not users:
         return 0.0, 0.0
-    monthly, annual = calc_tool_costs(tool)
+    cycle = tool.get("billing_cycle", "Monthly")
     if project_name is None:
-        return monthly / len(users), annual / len(users)
-    frac = tool_alloc_for(data, tool, project_name)
-    return monthly * frac, annual * frac
+        try:
+            amt = float(tool.get("cost", 0)) / len(users)
+        except (TypeError, ValueError):
+            amt = 0.0
+    else:
+        amt = tool_split_for(data, tool, project_name)
+    return _cycle_amount_to_monthly_annual(amt, cycle)
+
+
+def tool_split_status(data: dict, tool: dict):
+    """Compare the entered custom split against the tool's cost.
+    Returns (entered_total, cost, diff) where diff = entered − cost,
+    or None when no custom split is set."""
+    custom = tool_split_amounts(data, tool)
+    if not custom:
+        return None
+    try:
+        cost = float(tool.get("cost", 0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    entered = sum(custom.values())
+    return entered, cost, entered - cost
 
 
 def wo_project_total(data: dict, proj_name: str) -> float:
@@ -477,6 +521,16 @@ def get_all_notifications(data: dict) -> list:
         if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
             notifs.append(("🔵", "WO Mismatch", name,
                            f"WO ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f} (diff ${abs(wo_t-contracted):,.2f})"))
+    # 3b. Tool split mismatches (entered $ split ≠ tool cost)
+    for t in data["tools"]:
+        status = tool_split_status(data, t)
+        if status:
+            entered, cost, diff = status
+            if abs(diff) > 0.01:
+                word = "unassigned" if diff < 0 else "over-assigned"
+                notifs.append(("🔵", "Tool Split Mismatch", t.get("name", ""),
+                               f"Split ${entered:,.2f} ≠ cost ${cost:,.2f} "
+                               f"(${abs(diff):,.2f} {word})"))
     # 4. Tool renewals
     for t in data["tools"]:
         if t.get("paid") or t.get("billing_cycle") == "One-time":

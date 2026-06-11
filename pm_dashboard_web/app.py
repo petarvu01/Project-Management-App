@@ -11,7 +11,8 @@ from data import (load_data, save_data, blank_project, blank_line,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, project_hours_summary,
                   count_tool_users, tool_share_costs, gist_configured,
-                  tool_users, tool_alloc_for, tool_has_custom_split,
+                  tool_users, tool_split_for, tool_split_amounts,
+                  tool_has_custom_split, tool_split_status,
                   compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
@@ -561,27 +562,74 @@ elif page == "Project View":
                 full_mc, full_ac = calc_tool_costs(t)
                 share_mc, share_ac = tool_share_costs(D(), t, active)
                 n_users = count_tool_users(D(), tn)
-                frac = tool_alloc_for(D(), t, active)
+                cycle = t.get("billing_cycle", "Monthly")
                 split_label = (f"{n_users} project{'s' if n_users != 1 else ''}"
-                               + (" (custom)" if tool_has_custom_split(D(), t) else ""))
+                               + (" (custom $)" if tool_has_custom_split(D(), t) else ""))
                 total_m_share += share_mc; total_a_share += share_ac
                 tool_data.append({
                     "Tool": tn, "Vendor": t.get("vendor", ""),
                     "Full Annual": f"${full_ac:,.2f}",
                     "Split among": split_label,
-                    "Share %": f"{frac * 100:.0f}%",
+                    f"Share / {cycle.lower()}": f"${tool_split_for(D(), t, active):,.2f}",
                     "Your share / mo": f"${share_mc:,.2f}",
                     "Your share / yr": f"${share_ac:,.2f}",
                 })
             else:
                 tool_data.append({"Tool": tn, "Vendor": "—",
-                                  "Full Annual": "—", "Split among": "—", "Share %": "—",
+                                  "Full Annual": "—", "Split among": "—",
                                   "Your share / mo": "—", "Your share / yr": "—"})
         st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
         st.markdown(f"**This project's share: ${total_m_share:,.2f}/mo · "
                     f"${total_a_share:,.2f}/yr**")
-        st.caption("Shared tools split equally by default; set a custom split per tool "
-                   "on the Tools tab.")
+        st.caption("Shared tools split equally by default; enter custom $ amounts below "
+                   "or on the Tools tab.")
+
+        # ── Inline $ split editor ──────────────────────────────────────
+        shared_tools = [tn for tn in assigned if count_tool_users(D(), tn) >= 2]
+        if shared_tools:
+            with st.expander("✏️ Edit cost split ($)"):
+                pick = st.selectbox("Tool", shared_tools, key=f"pv_split_tool_{active}")
+                t_sel = next((x for x in D()["tools"] if x.get("name") == pick), None)
+                if t_sel:
+                    users = tool_users(D(), pick)
+                    cycle = t_sel.get("billing_cycle", "Monthly")
+                    try:
+                        cost = float(t_sel.get("cost", 0))
+                    except (TypeError, ValueError):
+                        cost = 0.0
+                    st.caption(f"{cycle} cost: **${cost:,.2f}** — enter each project's "
+                               f"dollar amount per {cycle.lower()} period.")
+                    sa = t_sel.get("split_amounts") or {}
+                    equal_amt = round(cost / len(users), 2) if users else 0.0
+                    amt_inputs = {}
+                    cols = st.columns(min(len(users), 4))
+                    for j, p in enumerate(users):
+                        default_amt = float(sa.get(p, equal_amt) or 0.0)
+                        with cols[j % len(cols)]:
+                            amt_inputs[p] = st.number_input(
+                                f"{p} ($)", min_value=0.0, value=default_amt,
+                                step=5.0, format="%.2f",
+                                key=f"pv_split_{active}_{pick}_{p}",
+                            )
+                    entered = sum(amt_inputs.values())
+                    diff = entered - cost
+                    if abs(diff) > 0.01:
+                        word = "unassigned" if diff < 0 else "over-assigned"
+                        st.warning(f"Entered ${entered:,.2f} of ${cost:,.2f} — "
+                                   f"${abs(diff):,.2f} {word}.")
+                    else:
+                        st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
+                    pc1, pc2 = st.columns(2)
+                    if pc1.button("💾 Save Split", key=f"pv_save_split_{active}_{pick}"):
+                        t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
+                        save()
+                        st.toast("Split saved")
+                        st.rerun()
+                    if pc2.button("↩️ Reset to equal split", key=f"pv_reset_split_{active}_{pick}"):
+                        t_sel["split_amounts"] = {}
+                        save()
+                        st.rerun()
+
         rem_tool = st.selectbox("Remove tool", assigned, key="rem_tool")
         if st.button("Remove Tool"):
             assigned.remove(rem_tool)
@@ -1258,51 +1306,59 @@ elif page == "Tools":
             t_sel = tools[i]
             users = tool_users(D(), t_sel.get("name", ""))
             if len(users) >= 2:
+                cycle = t_sel.get("billing_cycle", "Monthly")
+                try:
+                    cost = float(t_sel.get("cost", 0))
+                except (TypeError, ValueError):
+                    cost = 0.0
                 _, full_annual = calc_tool_costs(t_sel)
-                st.markdown("**Cost split across projects**")
-                st.caption(f"Full annual cost ${full_annual:,.2f}. Enter each project's "
-                           "percent — equal split is used until you save a custom one. "
-                           "If the percents don't sum to 100, shares are scaled "
-                           "proportionally.")
-                alloc = t_sel.get("allocations") or {}
-                equal_pct = round(100.0 / len(users), 2)
-                pct_inputs = {}
+                st.markdown("**Cost split across projects ($)**")
+                st.caption(f"{cycle} cost **${cost:,.2f}** (${full_annual:,.2f}/yr). "
+                           f"Enter each project's dollar amount per {cycle.lower()} "
+                           "period — equal split applies until you save a custom one. "
+                           "Projects left at $0 are charged nothing.")
+                sa = t_sel.get("split_amounts") or {}
+                equal_amt = round(cost / len(users), 2)
+                amt_inputs = {}
                 cols = st.columns(min(len(users), 4))
                 for j, p in enumerate(users):
-                    default_pct = float(alloc.get(p, equal_pct) or equal_pct)
+                    default_amt = float(sa.get(p, equal_amt) or 0.0)
                     with cols[j % len(cols)]:
-                        pct_inputs[p] = st.number_input(
-                            f"{p} %", min_value=0.0, max_value=100.0,
-                            value=default_pct, step=5.0, format="%.1f",
+                        amt_inputs[p] = st.number_input(
+                            f"{p} ($)", min_value=0.0, value=default_amt,
+                            step=5.0, format="%.2f",
                             key=f"alloc_{i}_{p}",
                         )
-                total_pct = sum(pct_inputs.values())
-                if abs(total_pct - 100.0) > 0.01:
-                    st.warning(f"Percents sum to {total_pct:.1f}% — shares will be "
-                               "scaled proportionally on save.")
+                entered = sum(amt_inputs.values())
+                diff = entered - cost
+                if abs(diff) > 0.01:
+                    word = "unassigned" if diff < 0 else "over-assigned"
+                    st.warning(f"Entered ${entered:,.2f} of ${cost:,.2f} — "
+                               f"${abs(diff):,.2f} {word}. Amounts are kept exactly "
+                               "as typed.")
                 else:
-                    st.caption(f"✓ Sums to {total_pct:.0f}%")
+                    st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
                 sc1, sc2 = st.columns(2)
                 if sc1.button("💾 Save Split", key=f"save_split_{i}"):
-                    if total_pct <= 0:
-                        st.error("At least one project needs a percent above 0.")
-                    else:
-                        t_sel["allocations"] = {p: float(v) for p, v in pct_inputs.items()}
-                        save()
-                        st.toast("Custom split saved")
-                        st.rerun()
+                    t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
+                    save()
+                    st.toast("Custom $ split saved")
+                    st.rerun()
                 if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
-                    t_sel["allocations"] = {}
+                    t_sel["split_amounts"] = {}
                     save()
                     st.rerun()
-                # Preview of resulting dollar shares
-                if total_pct > 0:
-                    preview = [{"Project": p,
-                                "Share": f"{(v / total_pct) * 100:.1f}%",
-                                "$ / yr": f"${full_annual * v / total_pct:,.2f}"}
-                               for p, v in pct_inputs.items()]
-                    st.dataframe(pd.DataFrame(preview), use_container_width=True,
-                                 hide_index=True)
+                # Preview of resulting annual shares (exactly as entered, annualized)
+                from data import _cycle_amount_to_monthly_annual
+                preview = []
+                for p, v in amt_inputs.items():
+                    pm, pa = _cycle_amount_to_monthly_annual(v, cycle)
+                    preview.append({"Project": p,
+                                    f"$ / {cycle.lower()}": f"${v:,.2f}",
+                                    "$ / mo": f"${pm:,.2f}",
+                                    "$ / yr": f"${pa:,.2f}"})
+                st.dataframe(pd.DataFrame(preview), use_container_width=True,
+                             hide_index=True)
             elif len(users) == 1:
                 st.caption(f"Only **{users[0]}** uses this tool — it bears the full cost. "
                            "Assign the tool to more projects to split it.")
