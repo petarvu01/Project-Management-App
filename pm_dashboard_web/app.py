@@ -176,15 +176,6 @@ st.markdown("""<style>
 
     /* Hide default radio buttons */
     [data-testid="stSidebar"] .stRadio { display: none; }
-
-    /* Print styles — hide sidebar + Streamlit UI chrome, expand main content */
-    @media print {
-        [data-testid="stSidebar"], [data-testid="stToolbar"],
-        [data-testid="stDecoration"], [data-testid="stStatusWidget"],
-        header, footer, .stDeployButton { display: none !important; }
-        section[data-testid="stSidebar"] { display: none !important; }
-        .main .block-container { max-width: 100% !important; padding: 0 !important; }
-    }
 </style>""", unsafe_allow_html=True)
 
 # ─── Sidebar navigation ─────────────────────────────────────────────────
@@ -262,13 +253,6 @@ with st.sidebar:
         json.dumps(st.session_state.data, indent=2),
         "dashboard_progress.json", "application/json",
         use_container_width=True, key="sidebar_backup",
-    )
-    st.markdown(
-        '<button onclick="window.print()" style="width:100%; padding:8px; '
-        'margin-top:4px; border:1px solid #4a5568; border-radius:8px; '
-        'background:transparent; color:#94a3b8; cursor:pointer; '
-        'font-size:14px;">🖨️ Print Page</button>',
-        unsafe_allow_html=True,
     )
 
 page = st.session_state.page
@@ -1501,12 +1485,12 @@ elif page == "Templates":
         st.caption("Copy any placeholder above into your .docx template. "
                    "The app replaces every occurrence with the current value.")
 
-    # ── Step 3: Fill and download ───────────────────────────────────────
+    # ── Step 3: Fill and export ───────────────────────────────────────
     if uploaded is not None:
-        if st.button("📄 Fill Template & Download", type="primary"):
+        if st.button("📄 Fill Template", type="primary"):
             try:
                 from docx import Document
-                import io, copy, re
+                import io
 
                 doc = Document(io.BytesIO(uploaded.getvalue()))
 
@@ -1545,23 +1529,107 @@ elif page == "Templates":
                                         for para in cell.paragraphs:
                                             replace_in_paragraph(para, mapping)
 
-                buf = io.BytesIO()
-                doc.save(buf)
-                buf.seek(0)
+                # Save filled .docx
+                buf_docx = io.BytesIO()
+                doc.save(buf_docx)
+                buf_docx.seek(0)
 
                 safe_name = tpl_proj.replace(" ", "_")
                 rec_label = f"_{selected_row['number']}" if selected_row else ""
-                filename = f"{safe_name}{rec_label}_filled.docx"
 
-                st.download_button(
-                    "⬇️ Download filled document",
-                    buf.getvalue(), filename,
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+                # Build a PDF from the filled document content
+                from fpdf import FPDF
+
+                pdf = FPDF()
+                pdf.set_auto_page_break(auto=True, margin=20)
+                pdf.add_page()
+                pdf.set_font("Helvetica", size=10)
+
+                def _pdf_safe(text):
+                    """Replace Unicode chars that Helvetica can't encode."""
+                    return (text
+                            .replace("\u2014", "--")   # em-dash
+                            .replace("\u2013", "-")    # en-dash
+                            .replace("\u2018", "'")    # left single quote
+                            .replace("\u2019", "'")    # right single quote
+                            .replace("\u201c", '"')    # left double quote
+                            .replace("\u201d", '"')    # right double quote
+                            .replace("\u2026", "...")   # ellipsis
+                            .replace("\u2022", "*")    # bullet
+                            .replace("\u00a0", " ")    # non-breaking space
+                            .encode("latin-1", errors="replace").decode("latin-1"))
+
+                # Extract filled paragraphs
+                for para in doc.paragraphs:
+                    text = _pdf_safe(para.text.strip())
+                    if not text:
+                        pdf.ln(4)
+                        continue
+                    # Detect heading-like text (short + bold runs)
+                    is_bold = (para.runs and para.runs[0].bold)
+                    if is_bold:
+                        pdf.set_font("Helvetica", style="B", size=11)
+                    else:
+                        pdf.set_font("Helvetica", size=10)
+                    pdf.multi_cell(0, 6, text)
+                    pdf.ln(1)
+
+                # Extract filled tables
+                for table in doc.tables:
+                    pdf.ln(4)
+                    n_cols = len(table.columns)
+                    col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / max(n_cols, 1)
+                    for ri, row in enumerate(table.rows):
+                        # Header row in bold
+                        if ri == 0:
+                            pdf.set_font("Helvetica", style="B", size=9)
+                        else:
+                            pdf.set_font("Helvetica", size=9)
+                        row_h = 6
+                        # Calculate max lines for this row
+                        cell_texts = [_pdf_safe(cell.text.strip().replace("\n", " | "))
+                                      for cell in row.cells]
+                        for ct in cell_texts:
+                            lines = max(1, len(ct) // int(col_w / 2) + 1)
+                            row_h = max(row_h, lines * 5)
+                        for ci, ct in enumerate(cell_texts):
+                            x = pdf.get_x()
+                            y = pdf.get_y()
+                            pdf.rect(x, y, col_w, row_h)
+                            pdf.set_xy(x + 1, y + 1)
+                            pdf.multi_cell(col_w - 2, 5, ct)
+                            pdf.set_xy(x + col_w, y)
+                        pdf.ln(row_h)
+                    pdf.ln(2)
+
+                buf_pdf = io.BytesIO()
+                pdf.output(buf_pdf)
+                buf_pdf.seek(0)
+
                 st.success(f"Filled {sum(1 for t in mapping if mapping[t])} placeholders.")
 
-            except ImportError:
-                st.error("python-docx is not installed. Add it to requirements.txt.")
+                # Export buttons side by side
+                st.subheader("Export")
+                ec1, ec2 = st.columns(2)
+                ec1.download_button(
+                    "⬇️ Download .docx",
+                    buf_docx.getvalue(),
+                    f"{safe_name}{rec_label}_filled.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+                ec2.download_button(
+                    "⬇️ Download .pdf",
+                    buf_pdf.getvalue(),
+                    f"{safe_name}{rec_label}_filled.pdf",
+                    "application/pdf",
+                    use_container_width=True,
+                )
+                st.caption("The .docx preserves your template's formatting. "
+                           "The .pdf is a clean export of the filled content.")
+
+            except ImportError as ie:
+                st.error(f"Missing library: {ie}. Check requirements.txt.")
             except Exception as e:
                 st.error(f"Error filling template: {e}")
     else:
