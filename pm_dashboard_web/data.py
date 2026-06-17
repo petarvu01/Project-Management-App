@@ -60,6 +60,10 @@ def blank_project(code, name, has_budget=False):
         "contracted_hours": 0.0,
         "assigned_tools": [],
         "lines": [blank_line("Phase 1 - Setup"), blank_line("Phase 2 - Core Dev")],
+        "client": {
+            "name": "", "position": "", "company": "",
+            "address": "", "phone": "", "email": "",
+        },
     }
 
 
@@ -200,6 +204,10 @@ def _normalize(data: dict) -> dict:
         proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
         if not proj["lines"]:
             proj["lines"] = [blank_line()]
+        # Client info defaults
+        cli = proj.setdefault("client", {})
+        for ck in ("name", "position", "company", "address", "phone", "email"):
+            cli.setdefault(ck, "")
     data["project_records"] = pr
     data.setdefault("student_credits", [])
     data.setdefault("invoices", [])
@@ -669,3 +677,114 @@ def compute_kpis(data: dict) -> dict:
         "tools_annual":         f"${tools_annual:,.2f}",
         "students_count":       f"{len(data.get('student_credits', []))}",
     }
+
+
+# ─── Template placeholder engine ─────────────────────────────────────────
+TEMPLATE_PLACEHOLDERS = [
+    # ── Project fields ──
+    ("{{project_name}}",        "Project name"),
+    ("{{project_code}}",        "Project code (e.g. I0850)"),
+    ("{{start_date}}",          "Project start date"),
+    ("{{end_date}}",            "Project end date"),
+    ("{{extension_date}}",      "Extension date (blank if none)"),
+    # ── Client info ──
+    ("{{client_name}}",         "Client contact name"),
+    ("{{client_position}}",     "Client position / title"),
+    ("{{client_company}}",      "Client company name"),
+    ("{{client_address}}",      "Client address (street, city, zip)"),
+    ("{{client_phone}}",        "Client phone number"),
+    ("{{client_email}}",        "Client email address"),
+    # ── Current date ──
+    ("{{current_date}}",        "Today's date (e.g. Jun 17, 2026)"),
+    ("{{current_date_iso}}",    "Today's date ISO (2026-06-17)"),
+    # ── Hours (project-level) ──
+    ("{{contracted_hours}}",    "Annual contracted hours budget"),
+    ("{{hours_deducted}}",      "Total hours deducted (all lines)"),
+    ("{{hours_remaining}}",     "Remaining hours (budget − deducted)"),
+    # ── Financial (project-level) ──
+    ("{{contracted_total}}",    "Total contracted $ budget (all lines)"),
+    ("{{total_invoiced}}",      "Sum of all invoice/WO amounts for this project"),
+    ("{{total_paid}}",          "Sum of paid invoice/WO amounts"),
+    ("{{outstanding_balance}}", "Invoiced but unpaid (total_invoiced − total_paid)"),
+    ("{{budget_remaining}}",    "Contracted $ − total invoiced"),
+    # ── Selected invoice / WO record ──
+    ("{{record_type}}",         "Invoice or Work Order"),
+    ("{{record_number}}",       "Invoice/WO number"),
+    ("{{record_amount}}",       "This record's amount ($)"),
+    ("{{record_description}}",  "Description / period label"),
+    ("{{record_date}}",         "Invoice date"),
+    ("{{record_net_terms}}",    "Net terms (e.g. Net 30)"),
+    ("{{record_payment_due}}",  "Payment due date"),
+    ("{{record_sent}}",         "Sent status (Yes / No)"),
+    ("{{record_paid}}",         "Paid status (Yes / No)"),
+    ("{{record_hours_deducted}}","Hours deducted field (invoices only)"),
+    # ── WO-specific ──
+    ("{{wo_total}}",            "Full Work Order total (all installments)"),
+]
+
+
+def build_placeholder_map(data: dict, proj_name: str,
+                          flat_row: dict = None) -> dict:
+    """Build a {placeholder: value} mapping for a given project and optional
+    invoice/WO row (as returned by flat_invoice_rows)."""
+    proj = data.get("project_records", {}).get(proj_name, {})
+    today = date.today()
+
+    # Project
+    ext = proj.get("extension_date", "")
+    end = proj.get("end_date", "")
+    cli = proj.get("client", {})
+    m = {
+        "{{project_name}}":      proj_name,
+        "{{project_code}}":      proj.get("code", ""),
+        "{{start_date}}":        fmt_date(proj.get("start_date", "")),
+        "{{end_date}}":          fmt_date(end),
+        "{{extension_date}}":    fmt_date(ext) if ext else "",
+        "{{client_name}}":       cli.get("name", ""),
+        "{{client_position}}":   cli.get("position", ""),
+        "{{client_company}}":    cli.get("company", ""),
+        "{{client_address}}":    cli.get("address", ""),
+        "{{client_phone}}":      cli.get("phone", ""),
+        "{{client_email}}":      cli.get("email", ""),
+        "{{current_date}}":      today.strftime("%b %d, %Y"),
+        "{{current_date_iso}}":  today.strftime("%Y-%m-%d"),
+    }
+
+    # Hours
+    ch = float(proj.get("contracted_hours", 0) or 0)
+    _, hrs_ded = project_hours_summary(proj)
+    m["{{contracted_hours}}"]  = f"{ch:,.1f}"
+    m["{{hours_deducted}}"]    = f"{hrs_ded:,.1f}"
+    m["{{hours_remaining}}"]   = f"{ch - hrs_ded:,.1f}"
+
+    # Financial
+    contracted = project_contracted_total(proj)
+    rows = flat_invoice_rows(data, proj_filter=proj_name)
+    total_inv = sum(r["inst_amount"] for r in rows)
+    total_paid_amt = sum(r["inst_amount"] for r in rows if r["paid"])
+    m["{{contracted_total}}"]    = f"${contracted:,.2f}"
+    m["{{total_invoiced}}"]      = f"${total_inv:,.2f}"
+    m["{{total_paid}}"]          = f"${total_paid_amt:,.2f}"
+    m["{{outstanding_balance}}"] = f"${total_inv - total_paid_amt:,.2f}"
+    m["{{budget_remaining}}"]    = f"${contracted - total_inv:,.2f}"
+
+    # Selected record
+    if flat_row:
+        m["{{record_type}}"]          = flat_row.get("type", "")
+        m["{{record_number}}"]        = flat_row.get("number", "")
+        m["{{record_amount}}"]        = f"${flat_row.get('inst_amount', 0):,.2f}"
+        m["{{record_description}}"]   = flat_row.get("description", "")
+        m["{{record_date}}"]          = fmt_date(flat_row.get("due_date", ""))
+        m["{{record_net_terms}}"]     = flat_row.get("net_terms", "")
+        m["{{record_payment_due}}"]   = fmt_date(flat_row.get("payment_due", ""))
+        m["{{record_sent}}"]          = "Yes" if flat_row.get("sent") else "No"
+        m["{{record_paid}}"]          = "Yes" if flat_row.get("paid") else "No"
+        m["{{record_hours_deducted}}"]= str(flat_row.get("hours_deducted", ""))
+        m["{{wo_total}}"]             = (f"${flat_row.get('wo_total', 0):,.2f}"
+                                         if flat_row.get("type") == "Work Order" else "")
+    else:
+        for tag, _ in TEMPLATE_PLACEHOLDERS:
+            if tag.startswith("{{record_") or tag == "{{wo_total}}":
+                m.setdefault(tag, "")
+
+    return m
