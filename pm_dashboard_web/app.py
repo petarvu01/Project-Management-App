@@ -176,6 +176,15 @@ st.markdown("""<style>
 
     /* Hide default radio buttons */
     [data-testid="stSidebar"] .stRadio { display: none; }
+
+    /* Print styles — hide sidebar + Streamlit UI chrome, expand main content */
+    @media print {
+        [data-testid="stSidebar"], [data-testid="stToolbar"],
+        [data-testid="stDecoration"], [data-testid="stStatusWidget"],
+        header, footer, .stDeployButton { display: none !important; }
+        section[data-testid="stSidebar"] { display: none !important; }
+        .main .block-container { max-width: 100% !important; padding: 0 !important; }
+    }
 </style>""", unsafe_allow_html=True)
 
 # ─── Sidebar navigation ─────────────────────────────────────────────────
@@ -253,6 +262,13 @@ with st.sidebar:
         json.dumps(st.session_state.data, indent=2),
         "dashboard_progress.json", "application/json",
         use_container_width=True, key="sidebar_backup",
+    )
+    st.markdown(
+        '<button onclick="window.print()" style="width:100%; padding:8px; '
+        'margin-top:4px; border:1px solid #4a5568; border-radius:8px; '
+        'background:transparent; color:#94a3b8; cursor:pointer; '
+        'font-size:14px;">🖨️ Print Page</button>',
+        unsafe_allow_html=True,
     )
 
 page = st.session_state.page
