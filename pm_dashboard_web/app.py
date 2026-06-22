@@ -9,12 +9,16 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
-                  get_fy_options, project_in_fy, project_hours_summary,
+                  get_fy_options, project_in_fy, tool_in_fy, project_hours_summary,
+                  credits_for_fy, project_credits, set_credits_for_fy,
                   count_tool_users, tool_share_costs, gist_configured,
+                  fy_funding_rows, fy_carry_in_for, fy_budget_available,
+                  fy_hours_available, fy_total_budget_added, fy_actual_spend,
+                  fy_hours_spend, fy_lines, flatten_lines, project_primary_fy,
+                  fy_contracted_budget, fy_contracted_hours, fy_hours_summary,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
-                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS,
-                  TEMPLATE_PLACEHOLDERS, build_placeholder_map)
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -94,6 +98,28 @@ def fy_choices():
     return [fy_label(y) for y in sorted(years)]
 
 
+def _fy_year_of(label):
+    """Parse the fiscal-year start-year integer out of any FY label."""
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def sw_count_for_fy(fy):
+    """Count of student-worker rows saved for a fiscal year, matched by YEAR so
+    it works regardless of label format ('FY 2025-26' vs 'FY 2025-26 (FY26)').
+    This is the roster row count (header is stored separately, not counted)."""
+    sw = D().get("student_workers", {})
+    if fy == "All":
+        return sum(len((r or {}).get("data", [])) for r in sw.values())
+    target = _fy_year_of(fy)
+    for key, rec in sw.items():
+        if _fy_year_of(key) == target:
+            return len((rec or {}).get("data", []))
+    return 0
+
+
 def read_excel(file):
     """Read an uploaded Excel file into a DataFrame, with date columns as strings."""
     df = pd.read_excel(file)
@@ -126,6 +152,45 @@ def store_to_df(store):
     if not store:
         return pd.DataFrame()
     return pd.DataFrame(store.get("data", []), columns=store.get("columns", []))
+
+
+def parse_credit_rows(df):
+    """Map a credits DataFrame (Name, Student ID, Credits, Project) to records.
+    Column matching is case-insensitive. Returns (records, error_message)."""
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    def find(*needles):
+        for n in needles:
+            for low, orig in cols.items():
+                if n in low:
+                    return orig
+        return None
+
+    c_name = find("name")
+    c_id = find("student id", "id")
+    c_cred = find("credit")
+    c_proj = find("project")
+    missing = [lbl for lbl, c in
+               [("Credits", c_cred), ("Project", c_proj)] if c is None]
+    if missing:
+        return [], (f"Missing required column(s): {', '.join(missing)}. "
+                    "The file needs columns: Name, Student ID, Credits, Project.")
+    records = []
+    for _, row in df.iterrows():
+        proj = "" if c_proj is None or pd.isna(row[c_proj]) else str(row[c_proj]).strip()
+        if not proj:
+            continue  # skip rows with no project
+        try:
+            creds = float(row[c_cred]) if pd.notna(row[c_cred]) else 0.0
+        except (TypeError, ValueError):
+            creds = 0.0
+        records.append({
+            "name": "" if c_name is None or pd.isna(row[c_name]) else str(row[c_name]).strip(),
+            "student_id": "" if c_id is None or pd.isna(row[c_id]) else str(row[c_id]).strip(),
+            "credits": creds,
+            "project": proj,
+        })
+    return records, None
 
 
 # ─── Custom CSS ──────────────────────────────────────────────────────────
@@ -188,8 +253,6 @@ NAV_ITEMS = [
     ("👥", "Student Workers"),
     ("📄", "Invoices / WO"),
     ("🛠️", "Tools"),
-    ("👤", "Clients"),
-    ("📝", "Templates"),
     ("🆚", "Results"),
 ]
 
@@ -337,9 +400,18 @@ elif page == "Project View":
     pr = D()["project_records"]
     projects = projects_sorted()
 
+    # If a project was just created, land on it (must be set BEFORE the
+    # selectbox is built so the widget picks it up).
+    _new = st.session_state.pop("_new_project_name", None)
+    if _new and _new in projects:
+        st.session_state["proj_select"] = _new
+    # Drop a stale selection (e.g. after a delete) so the box doesn't error.
+    if st.session_state.get("proj_select") not in projects:
+        st.session_state.pop("proj_select", None)
+
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        active = st.selectbox("Active Project", projects)
+        active = st.selectbox("Active Project", projects, key="proj_select")
     with col2:
         if st.button("➕ Add Project"):
             st.session_state.show_add_project = True
@@ -356,7 +428,10 @@ elif page == "Project View":
         dc1, dc2, _ = st.columns([1, 1, 4])
         if dc1.button("Yes, delete", type="primary"):
             del pr[active]
-            D()["student_credits"] = [s for s in D()["student_credits"] if s["project"] != active]
+            scbf = D().setdefault("student_credits_by_fy", {})
+            for k in list(scbf.keys()):
+                scbf[k] = [s for s in scbf[k] if s.get("project") != active]
+            D()["student_credits"] = [s for recs in scbf.values() for s in recs]
             st.session_state.confirm_del_proj = False
             save()
             st.toast(f"Removed {active}")
@@ -384,6 +459,7 @@ elif page == "Project View":
                         pr[new_name] = p
                         save()
                         st.session_state.show_add_project = False
+                        st.session_state["_new_project_name"] = new_name
                         st.toast(f"Created {new_name}")
                         st.rerun()
                     else:
@@ -396,68 +472,151 @@ elif page == "Project View":
 
     proj = pr[active]
 
-    # Dates
+    # ── Dates ────────────────────────────────────────────────────────
     st.subheader("Project Dates")
     dc1, dc2, dc3, dc4 = st.columns([2, 2, 2, 1])
     sd = dc1.date_input("Start Date", value=parse_date(proj.get("start_date", "")),
-                        key="proj_start", format="YYYY-MM-DD")
+                        key=f"proj_start_{active}", format="YYYY-MM-DD")
     ed = dc2.date_input("End Date", value=parse_date(proj.get("end_date", "")),
-                        key="proj_end", format="YYYY-MM-DD")
+                        key=f"proj_end_{active}", format="YYYY-MM-DD")
     ext = dc3.date_input("Extension", value=parse_date(proj.get("extension_date", "")),
-                         key="proj_ext", format="YYYY-MM-DD")
-    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False), key="nb_chk")
-
-    if st.button("💾 Save Dates"):
+                         key=f"proj_ext_{active}", format="YYYY-MM-DD")
+    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False),
+                             key=f"nb_chk_{active}")
+    btn_c1, btn_c2, _ = st.columns([1, 1, 3])
+    if btn_c1.button("💾 Save Dates", key=f"save_dates_{active}"):
         proj["start_date"] = str(sd) if sd else ""
         proj["end_date"] = str(ed) if ed else ""
         proj["extension_date"] = str(ext) if ext else ""
         proj["has_budget"] = no_budget
+        st.session_state.pop(f"view_fy_{active}", None)
         save()
         st.toast("Dates saved")
-
-    # ── Contracted Hours (annual budget) ─────────────────────────────
-    st.subheader("Contracted Hours")
-    ch_budget, ch_deducted = project_hours_summary(proj)
-    tracks_hours = ch_budget > 0
-
-    if tracks_hours:
-        ch_remaining = ch_budget - ch_deducted
-        ch_pct = ch_deducted / ch_budget * 100
-        ch_c1, ch_c2, ch_c3, ch_c4 = st.columns([2, 1, 1, 1])
-        with ch_c1:
-            new_ch = st.number_input(
-                "Annual Cont. Hours (budget)",
-                value=float(ch_budget), min_value=0.0, step=1.0, format="%.1f",
-                key=f"cont_hours_{active}",
-            )
-            if st.button("💾 Save Cont. Hours", key=f"save_ch_{active}"):
-                proj["contracted_hours"] = float(new_ch)
-                save()
-                st.toast("Contracted Hours saved")
-                st.rerun()
-        ch_c2.metric("Deducted", f"{ch_deducted:.0f} hrs")
-        ch_c3.metric("Remaining", f"{ch_remaining:.0f} hrs")
-        ch_c4.metric("% Used", f"{ch_pct:.1f}%")
-    else:
-        # No contracted hours set — show input only; deduction tracking is disabled.
-        new_ch = st.number_input(
-            "Annual Cont. Hours (budget)",
-            value=0.0, min_value=0.0, step=1.0, format="%.1f",
-            key=f"cont_hours_{active}",
-        )
-        if st.button("💾 Save Cont. Hours", key=f"save_ch_{active}"):
-            proj["contracted_hours"] = float(new_ch)
+        st.rerun()
+    if proj.get("extension_date"):
+        if btn_c2.button("🗑️ Clear Extension", key=f"clear_ext_{active}"):
+            proj["extension_date"] = ""
+            # reset the date widget so it shows empty again
+            st.session_state.pop(f"proj_ext_{active}", None)
+            st.session_state.pop(f"view_fy_{active}", None)
             save()
-            st.toast("Contracted Hours saved")
+            st.toast("Extension date removed")
             st.rerun()
-        st.caption("No contracted hours set — hours-deduction tracking is off for this "
-                   "project. Set a value above to turn it on.")
+
+    # ── Status (auto-Finished when past-dated; Renewed when extended) ─
+    status_options = ["Active", "On Pause", "Finished"]
+    badge = {"Active": "🟢", "On Pause": "🟡", "Finished": "⚪"}
+    stored_status = proj.get("status", "Active")
+    if stored_status not in status_options:
+        stored_status = "Active"
+    saved_end = parse_date(proj.get("end_date", ""))
+    saved_ext = parse_date(proj.get("extension_date", ""))
+    latest_date = saved_ext or saved_end
+    is_renewed = bool(saved_ext)
+    auto_finished = bool(latest_date and latest_date < date.today())
+    effective_status = "Finished" if auto_finished else stored_status
+
+    stc1, stc2 = st.columns([2, 3])
+    with stc1:
+        new_status = st.selectbox(
+            "Project Status", status_options,
+            index=status_options.index(stored_status),
+            key=f"proj_status_{active}", disabled=auto_finished,
+            help="A project whose end/extension date is in the past is "
+                 "automatically marked Finished.",
+        )
+    if not auto_finished and new_status != stored_status:
+        proj["status"] = new_status
+        save()
+        st.toast(f"Status set to {new_status}")
+    badge_line = f"### {badge.get(effective_status, '')} {effective_status}"
+    if is_renewed:
+        badge_line += "  ·  🔄 Renewed"
+    stc2.markdown(badge_line)
+    if auto_finished:
+        stc2.caption("Auto-set to Finished — the date has passed.")
+
+    # ── Fiscal-year filter (scopes budget, line items & hours below) ──
+    st.subheader("Fiscal Year")
+    vfy_opts = [o for o in get_fy_options(D()) if o != "All"]
+    for k in (list(proj.get("lines_by_fy", {}).keys())
+              + list(proj.get("contracted_hours_by_fy", {}).keys())):
+        vfy_opts.append(fy_label(int(k)))
+    vfy_this = fy_label(date_to_fy(date.today()))
+    vfy_opts.append(vfy_this)
+    vfy_opts.append(fy_label(project_primary_fy(proj)))
+    # Default: the project's START fiscal year — unless an extension date falls
+    # in a later FY, in which case open on the extension's FY.
+    start_d = parse_date(proj.get("start_date", ""))
+    start_fy = date_to_fy(start_d) if start_d else project_primary_fy(proj)
+    ext_d = parse_date(proj.get("extension_date", ""))
+    default_year = start_fy
+    if ext_d and date_to_fy(ext_d) > start_fy:
+        default_year = date_to_fy(ext_d)
+    # make sure the chosen year is selectable
+    if fy_label(default_year) not in vfy_opts:
+        vfy_opts.append(fy_label(default_year))
+    vfy_opts = sorted(set(vfy_opts), key=lambda lab: int(lab.split()[1].split("-")[0]))
+    default_lbl = fy_label(default_year)
+    vfy_idx = vfy_opts.index(default_lbl) if default_lbl in vfy_opts else 0
+    view_fy_label = st.selectbox(
+        "View / edit fiscal year", vfy_opts, index=vfy_idx, key=f"view_fy_{active}",
+        help="Budget, line items and hours below are for this fiscal year. "
+             "Unspent budget ($) and hours carry into the next FY after May 31.",
+    )
+    view_year = int(view_fy_label.split()[1].split("-")[0])
+    view_key = str(view_year)
+
+    # Per-FY budget summary (derived; carries over automatically at FY end).
+    # Carried-in is masked for fiscal years the project isn't running in, so an
+    # ended project doesn't appear to have a balance in a future FY.
+    project_running = project_in_fy(proj, view_fy_label)
+    if not proj.get("has_budget", False):
+        cin_d = fy_carry_in_for(proj, view_year)[0] if project_running else 0.0
+        contr_d = fy_contracted_budget(proj, view_year)
+        spent_d = fy_actual_spend(proj, view_year)
+        avail_d = cin_d + contr_d
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric("Carried in $", f"${cin_d:,.0f}")
+        bm2.metric("Contracted $ (budget)", f"${contr_d:,.0f}")
+        bm3.metric("Spent $ (actual)", f"${spent_d:,.0f}")
+        bm4.metric("Remaining $", f"${avail_d - spent_d:,.0f}")
+        if project_running:
+            st.caption(
+                f"Available this FY = carried-in + contracted = ${avail_d:,.0f}. "
+                f"Leftover (${avail_d - spent_d:,.0f}) carries into "
+                f"{fy_label(view_year + 1)} automatically after May 31."
+            )
+        else:
+            st.caption(
+                f"ℹ️ This project isn't running in {view_fy_label}, so any carried-over "
+                "balance is hidden here. Carry-over shows only in fiscal years the project "
+                "is active. Add an extension date that reaches into this FY to carry the "
+                "balance forward."
+            )
+
 
     # ── Line items (editable grid) ─────────────────────────────────────
-    st.subheader("Line Items")
-    grid_caption = ("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
-                    "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
-                    "then click Save Line Items.")
+    st.subheader(f"Line Items — {view_fy_label}")
+
+    # Line items belong to the fiscal year chosen in the Fiscal Year filter above.
+    lbf = proj.setdefault("lines_by_fy", {})
+    li_sel = view_fy_label
+    li_year = view_year
+    li_key = view_key
+    fy_rows_for_edit = lbf.get(li_key, [])
+    # Masked hours view: carried-in hours are hidden when the project isn't
+    # running in this FY (consistent with the budget summary above).
+    _h_cin = fy_carry_in_for(proj, view_year)[1] if project_running else 0.0
+    fy_h_avail = _h_cin + fy_contracted_hours(proj, view_year)
+    fy_h_spent = fy_hours_spend(proj, view_year)
+    fy_h_remaining = fy_h_avail - fy_h_spent
+    tracks_hours = fy_h_avail > 0
+
+    grid_caption = (f"Editing **{li_sel}** costs (change the Fiscal Year filter above to edit "
+                    "another year). Enter contracted amounts (the budget) and actual costs. "
+                    "Use the **＋** at the bottom to add a line, or tick a row and press "
+                    "Delete to remove it — then click Save Line Items.")
     if tracks_hours:
         grid_caption += (" Hours deducted from the Contracted Hours budget are computed "
                          "automatically: **(Students × Stu Hours) + PI Hours** per line.")
@@ -476,13 +635,13 @@ elif page == "Project View":
         "Cont. Indirect": line_value(row, 11),
         "Cont. Fringe": line_value(row, 12),
         "Cont. Travel": contracted_travel_cost(row),
-    } for row in proj["lines"]])
+    } for row in (fy_rows_for_edit or [blank_line()])])
 
     money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
     hours = st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")
     edited = st.data_editor(
         edit_df, use_container_width=True, hide_index=True,
-        num_rows="dynamic", key=f"lines_editor_{active}",
+        num_rows="dynamic", key=f"lines_editor_{active}_{li_key}",
         column_config={
             "Line Item": st.column_config.TextColumn(required=True, width="medium"),
             "Students": st.column_config.NumberColumn(min_value=0, step=1),
@@ -493,7 +652,7 @@ elif page == "Project View":
         },
     )
 
-    if st.button("💾 Save Line Items"):
+    if st.button("💾 Save Line Items", key=f"save_lines_{active}_{li_key}"):
         new_lines = [[
             (r["Line Item"] or "Untitled"),
             num(r["Students"], int), num(r["Stu Rate"]), num(r["Stu Hours"]),
@@ -502,14 +661,15 @@ elif page == "Project View":
             num(r["Cont. Personnel"]), num(r["Cont. PI"]),
             num(r["Cont. Indirect"]), num(r["Cont. Fringe"]), num(r["Cont. Travel"]),
         ] for _, r in edited.iterrows()]
-        proj["lines"] = new_lines or [blank_line()]
+        lbf[li_key] = new_lines or [blank_line()]
+        proj["lines"] = flatten_lines(proj) or [blank_line()]
         save()
-        st.toast("Line items saved")
+        st.toast(f"{li_sel} line items saved")
         st.rerun()
 
-    # Read-only computed recap (reflects the last saved state)
+    # Read-only computed recap (reflects the last saved state of THIS FY)
     recap = []
-    for row in proj["lines"]:
+    for row in lbf.get(li_key, []):
         s, sr, sh = int(line_value(row, 1)), line_value(row, 2), line_value(row, 3)
         pr2, ph = line_value(row, 4), line_value(row, 5)
         cont = (line_value(row, 9) + line_value(row, 10) + line_value(row, 11)
@@ -535,10 +695,57 @@ elif page == "Project View":
             st.caption("Computed costs (from last save)")
         st.dataframe(pd.DataFrame(recap), use_container_width=True, hide_index=True)
 
+    # ── Contracted Hours for this FY (% used / hours left) ────────────
+    st.subheader(f"Contracted Hours — {view_fy_label}")
+    chf = proj.setdefault("contracted_hours_by_fy", {})
+    cur_ch = float(chf.get(view_key, 0) or 0)
+    cin_h = fy_carry_in_for(proj, view_year)[1] if project_running else 0.0
+    hc1, hc2 = st.columns([2, 2])
+    with hc1:
+        new_ch = st.number_input(
+            f"Annual contracted hours for {view_fy_label}",
+            value=cur_ch, min_value=0.0, step=1.0, format="%.1f",
+            key=f"cont_hours_{active}_{view_key}",
+            help="Hours allocated for this fiscal year. Unspent hours carry "
+                 "into the next FY automatically after May 31.",
+        )
+    with hc2:
+        if cin_h:
+            st.caption(f"+ {cin_h:,.1f} hrs carried in from the prior FY.")
+    if st.button("💾 Save Contracted Hours", key=f"save_ch_{active}_{view_key}"):
+        if new_ch > 0:
+            chf[view_key] = float(new_ch)
+        else:
+            chf.pop(view_key, None)
+        save()
+        st.toast("Contracted Hours saved")
+        st.rerun()
+
+    avail_h, spent_h, remaining_h = fy_h_avail, fy_h_spent, fy_h_remaining
+    if avail_h > 0:
+        pct = (spent_h / avail_h * 100) if avail_h > 0 else 0
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Available", f"{avail_h:.0f} hrs")
+        h2.metric("Deducted", f"{spent_h:.0f} hrs")
+        h3.metric("Remaining", f"{remaining_h:.0f} hrs")
+        h4.metric("% Used", f"{pct:.1f}%")
+        st.caption("Hours Deducted = (Students × Stu Hours) + PI Hours, summed "
+                   f"over {view_fy_label} line items. Available = carried-in + "
+                   "contracted for this FY.")
+    else:
+        st.caption("No contracted hours set for this fiscal year — hours tracking "
+                   "is off. Enter a value above to turn it on.")
+
     # Notes
     st.subheader("Notes")
-    notes = st.text_area("Project notes", value=proj.get("notes", ""), key="proj_notes")
-    if st.button("💾 Save Notes"):
+    st.caption(f"Notes for: **{active}** (each project keeps its own)")
+    notes = st.text_area("Project notes", value=proj.get("notes", ""), key=f"proj_notes_{active}")
+    # Write straight to THIS project. Auto-saves on change so switching
+    # projects never mixes or loses notes, even if you forget the button.
+    if notes != proj.get("notes", ""):
+        proj["notes"] = notes
+        save()
+    if st.button("💾 Save Notes", key=f"save_notes_{active}"):
         proj["notes"] = notes
         save()
         st.toast("Notes saved")
@@ -654,16 +861,31 @@ elif page == "Master View":
     rows = []
     gt_b = gt_s = gt_p = 0.0; gt_c = 0
     gt_ch = 0.0
+    # Selected fiscal year (None = "All")
+    sel_year = None
+    if fy != "All":
+        try:
+            sel_year = int(fy.split()[1].split("-")[0])
+        except Exception:
+            sel_year = None
+    st.caption(
+        f"Budget shown is the **{fy}** budget = carried-in + contracted line items."
+        if sel_year is not None else
+        "Budget shown is total contracted budget across all fiscal years. "
+        "Pick a fiscal year to see that year's budget and spend."
+    )
     for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
-        budget = stu = pi = 0.0
-        for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
-            budget += line_value(row, 9) + line_value(row, 10) + line_value(row, 11) + line_value(row, 12) + contracted_travel_cost(row)
-            stu += actual_personnel_cost(row)
-            pi += actual_pi_cost(row)
+        if sel_year is not None:
+            budget = fy_budget_available(proj, sel_year)
+            scope_lines = fy_lines(proj, sel_year)
+        else:
+            budget = fy_total_budget_added(proj)
+            scope_lines = proj["lines"]
+        stu = sum(actual_personnel_cost(row) for row in scope_lines)
+        pi = sum(actual_pi_cost(row) for row in scope_lines)
         ch_budget, _ = project_hours_summary(proj)
-        credits = sum(s["credits"] for s in D()["student_credits"] if s["project"] == name)
+        credits = project_credits(D(), fy, name)
         ext = proj.get("extension_date", "")
         ed = proj.get("end_date", "")
         end_disp = fmt_date(ext if ext else ed) + (" ★" if ext else "")
@@ -706,37 +928,41 @@ elif page == "Actual vs Budget":
     fy = fc2.selectbox("Fiscal Year", get_fy_options(D()), key="avb_fy")
 
     rows = []
+    sel_year = None
+    if fy != "All":
+        try:
+            sel_year = int(fy.split()[1].split("-")[0])
+        except Exception:
+            sel_year = None
+    st.caption(
+        f"Budget = the **{fy}** budget (carried-in + contracted). Actuals = that year's "
+        "line-item spend (personnel + PI + actual travel). Tool costs are tracked "
+        "separately in Tools and aren't part of this per-FY comparison."
+        if sel_year is not None else
+        "Showing all fiscal years combined: Budget = total contracted, Actuals = "
+        "all line-item spend. Pick a fiscal year to compare a single year."
+    )
     for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
 
-        # Budget / contracted categories
-        cont_personnel = cont_pi = cont_indirect = cont_fringe = cont_travel = 0.0
+        if sel_year is not None:
+            budget = fy_budget_available(proj, sel_year)
+            carried_in_d = fy_carry_in_for(proj, sel_year)[0]
+            added_d = fy_contracted_budget(proj, sel_year)
+            scope_lines = fy_lines(proj, sel_year)
+        else:
+            budget = fy_total_budget_added(proj)
+            carried_in_d = 0.0
+            added_d = budget
+            scope_lines = proj["lines"]
 
-        # Actual / running cost categories
-        pers = pi = trv = tools_actual = 0.0
-
-        for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
-            cont_personnel += line_value(row, 9)
-            cont_pi += line_value(row, 10)
-            cont_indirect += line_value(row, 11)
-            cont_fringe += line_value(row, 12)
-            cont_travel += contracted_travel_cost(row)
-
-            # Actual cost = personnel + PI + actual travel + tools.
-            # Indirect and fringe are NOT included in actual/running cost.
+        pers = pi = trv = 0.0
+        for row in scope_lines:
             pers += actual_personnel_cost(row)
             pi += actual_pi_cost(row)
             trv += line_value(row, 8)
 
-        for tn in proj.get("assigned_tools", []):
-            t = next((x for x in D()["tools"] if x.get("name") == tn), None)
-            if t:
-                _, annual_share = tool_share_costs(D(), t, name)
-                tools_actual += annual_share
-
-        budget = cont_personnel + cont_pi + cont_indirect + cont_fringe + cont_travel
-        actuals = pers + pi + trv + tools_actual
+        actuals = pers + pi + trv
         if is_red:
             bstr, var_s, pct_s = "—", f"(${actuals:,.2f})", "—"
         else:
@@ -756,15 +982,11 @@ elif page == "Actual vs Budget":
             "Cont. Hours": f"{ch_budget:.0f}" if ch_budget > 0 else "—",
             "Actuals": f"${actuals:,.2f}",
             "Variance": var_s, "% Used": pct_s,
-            "_budget_personnel": cont_personnel,
-            "_budget_pi": cont_pi,
-            "_budget_indirect": cont_indirect,
-            "_budget_fringe": cont_fringe,
-            "_budget_travel": cont_travel,
+            "_budget_carried": carried_in_d,
+            "_budget_added": added_d,
             "_actual_personnel": pers,
             "_actual_pi": pi,
             "_actual_travel": trv,
-            "_actual_tools": tools_actual,
         })
 
     if rows:
@@ -777,17 +999,13 @@ elif page == "Actual vs Budget":
         for r in rows:
             with st.expander(f"{r['Project']} — {r['Budget']}"):
                 bdf = pd.DataFrame([
-                    {"Category": "Contracted Personnel", "Amount": f"${r['_budget_personnel']:,.2f}"},
-                    {"Category": "Contracted PI", "Amount": f"${r['_budget_pi']:,.2f}"},
-                    {"Category": "Contracted Indirect", "Amount": f"${r['_budget_indirect']:,.2f}"},
-                    {"Category": "Contracted Fringe", "Amount": f"${r['_budget_fringe']:,.2f}"},
-                    {"Category": "Contracted Travel", "Amount": f"${r['_budget_travel']:,.2f}"},
+                    {"Category": "Carried in (from prior FY)", "Amount": f"${r['_budget_carried']:,.2f}"},
+                    {"Category": "Contracted this FY", "Amount": f"${r['_budget_added']:,.2f}"},
                 ])
                 adf = pd.DataFrame([
                     {"Category": "Actual Personnel", "Amount": f"${r['_actual_personnel']:,.2f}"},
                     {"Category": "Actual PI", "Amount": f"${r['_actual_pi']:,.2f}"},
                     {"Category": "Actual Travel", "Amount": f"${r['_actual_travel']:,.2f}"},
-                    {"Category": "Actual Tools", "Amount": f"${r['_actual_tools']:,.2f}"},
                 ])
                 c1, c2 = st.columns(2)
                 with c1:
@@ -807,45 +1025,61 @@ elif page == "Actual vs Budget":
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Credits":
     st.title("🎓 Student Credits")
-    credits = D()["student_credits"]
+    D().setdefault("student_credits_by_fy", {})
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="cred_fy")
 
-    with st.form("add_credit"):
-        st.subheader("Assign Credits")
-        cc = st.columns(4)
-        name = cc[0].text_input("Student Name")
-        sid = cc[1].text_input("Student ID")
-        creds = cc[2].number_input("Credits", min_value=1, value=3)
-        proj = cc[3].selectbox("Project", projects_sorted())
-        if st.form_submit_button("Assign"):
-            if name and sid:
-                if any(s["student_id"] == sid for s in credits):
-                    st.error(f"Student ID '{sid}' already registered.")
-                else:
-                    credits.append({"name": name, "student_id": sid,
-                                    "credits": creds, "project": proj})
-                    save()
-                    st.rerun()
+    st.subheader("Load from Excel")
+    st.caption("Required columns: **Name, Student ID, Credits, Project** "
+               "(one row per student). Uploading replaces this fiscal year's credits.")
+    nonce = st.session_state.get(f"cred_nonce_{fy}", 0)
+    up = st.file_uploader(
+        f"Drag an Excel (.xlsx) file here to load {fy} credits",
+        type=["xlsx"], key=f"cred_upload_{fy}_{nonce}",
+    )
+    if up is not None:
+        try:
+            df_new = read_excel(up)
+            records, err = parse_credit_rows(df_new)
+            if err:
+                st.error(err)
             else:
-                st.error("Name and ID are required.")
+                st.caption(f"Preview — {len(records)} students with a project")
+                st.dataframe(df_new, use_container_width=True, hide_index=True)
+                if st.button(f"💾 Save to {fy}", type="primary", key=f"cred_save_{fy}"):
+                    set_credits_for_fy(D(), fy, records)
+                    save()
+                    st.session_state[f"cred_nonce_{fy}"] = nonce + 1
+                    st.toast(f"Saved {len(records)} credit rows to {fy}")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}. Save it as .xlsx with "
+                     "columns Name, Student ID, Credits, Project.")
 
-    if credits:
-        df = pd.DataFrame(credits)
+    # Current FY's credits + per-project totals
+    cur = credits_for_fy(D(), fy)
+    if cur:
+        st.subheader(f"Credits — {fy}")
+        df = pd.DataFrame(cur)[["name", "student_id", "credits", "project"]]
         df.columns = ["Name", "Student ID", "Credits", "Project"]
-        event = st.dataframe(
-            df, use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="credits_table",
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        totals = {}
+        for r in cur:
+            totals[r["project"]] = totals.get(r["project"], 0) + float(r.get("credits", 0) or 0)
+        st.subheader("Totals per project")
+        tdf = pd.DataFrame(
+            [{"Project": p, "Total Credits": c} for p, c in sorted(totals.items())]
         )
-        sel = event.selection.rows
-        if sel and sel[0] < len(credits):
-            i = sel[0]
-            st.caption(f"Selected: **{credits[i]['name']}** ({credits[i]['student_id']})")
-            if st.button("🗑️ Remove Student"):
-                rem_id = credits[i]["student_id"]
-                D()["student_credits"] = [s for s in credits if s["student_id"] != rem_id]
-                save()
-                st.rerun()
-        else:
-            st.caption("Click a row above to remove a student.")
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
+        m1, m2 = st.columns(2)
+        m1.metric("Students", len(cur))
+        m2.metric(f"Total credits — {fy}", f"{sum(float(r.get('credits',0) or 0) for r in cur):g}")
+
+        csv = df.to_csv(index=False)
+        st.download_button("⬇️ Download CSV", csv,
+                           f"credits_{fy.replace(' ', '_')}.csv", "text/csv")
+    else:
+        st.info(f"No credits loaded for {fy} yet. Upload an .xlsx above.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -859,18 +1093,23 @@ elif page == "Student Workers":
     fy = st.selectbox("Fiscal Year for this table", fy_choices(), key="sw_fy")
 
     st.subheader("Load from Excel")
+    # The uploader key carries a per-FY nonce so we can fully reset it (clear the
+    # preview) after a save. Changing FY also changes the key → fresh empty box.
+    nonce = st.session_state.get(f"sw_nonce_{fy}", 0)
     up = st.file_uploader(
-        f"Drag an Excel file here to load the {fy} student worker list",
-        type=["xlsx", "xls"], key="sw_upload",
+        f"Drag an Excel (.xlsx) file here to load the {fy} student worker list",
+        type=["xlsx"], key=f"sw_upload_{fy}_{nonce}",
     )
     if up is not None:
         try:
             df_new = read_excel(up)
             st.caption(f"Preview — {len(df_new)} rows, {len(df_new.columns)} columns")
             st.dataframe(df_new, use_container_width=True, hide_index=True)
-            if st.button(f"💾 Save to {fy}", type="primary"):
+            if st.button(f"💾 Save to {fy}", type="primary", key=f"sw_save_{fy}"):
                 sw[fy] = df_to_store(df_new)
                 save()
+                # Bump the nonce so the uploader resets and the preview disappears.
+                st.session_state[f"sw_nonce_{fy}"] = nonce + 1
                 st.toast(f"Saved {len(df_new)} student workers to {fy}")
                 st.rerun()
         except Exception as e:
@@ -1176,15 +1415,38 @@ elif page == "Tools":
     st.title("🛠️ Tools & Subscriptions")
     tools = D()["tools"]
 
-    # KPIs
-    total_m = total_a = 0.0
+    # Fiscal-year filter (based on each tool's start/end dates)
+    tfy_years = set()
     for t in tools:
-        mc, ac = calc_tool_costs(t)
-        total_m += mc; total_a += ac
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Tools", len(tools))
-    mc2.metric("Monthly Total", f"${total_m:,.2f}")
-    mc3.metric("Annual Total", f"${total_a:,.2f}")
+        for ds in (t.get("start_date", ""), t.get("end_date", "")):
+            d = parse_date(ds)
+            if d:
+                tfy_years.add(date_to_fy(d))
+    tfy_years.add(date_to_fy(date.today()))
+    tool_fy_opts = ["All"] + [fy_label(y) for y in sorted(tfy_years)]
+    tool_fy = st.selectbox("Fiscal Year", tool_fy_opts, key="tools_fy")
+
+    # Tools active in the selected FY, keeping their original index for edit/delete.
+    filtered = [(i, t) for i, t in enumerate(tools) if tool_in_fy(t, tool_fy)]
+
+    # KPIs (scoped to the selected FY): split tools into monthly vs one-time.
+    monthly_sum = onetime_sum = 0.0
+    for _, t in filtered:
+        cost = float(t.get("cost", 0) or 0)
+        if t.get("billing_cycle") == "Monthly":
+            monthly_sum += cost
+        else:
+            onetime_sum += cost
+    total_cost = monthly_sum * 12 + onetime_sum
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Tools", len(filtered))
+    mc2.metric("Total Tools Cost", f"${total_cost:,.2f}")
+    mc3.metric("Monthly Cost", f"${monthly_sum:,.2f}")
+    mc4.metric("One-time Cost", f"${onetime_sum:,.2f}")
+    if tool_fy != "All":
+        st.caption(f"Showing tools active in {tool_fy} "
+                   "(a tool with no end date counts as ongoing from its start).")
+    st.caption("Total = monthly tools × 12 + one-time tools × 1.")
 
     # Add / Edit tool using the same input form style
     st.subheader("Add / Edit Tool")
@@ -1206,7 +1468,7 @@ elif page == "Tools":
         else:
             st.info("No tools available to edit yet.")
 
-    cycle_options = ["Monthly", "Annual", "2-Year", "One-time"]
+    cycle_options = ["Monthly", "One-time"]
     current_cycle = selected_tool.get("billing_cycle", "Monthly")
     cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
 
@@ -1222,8 +1484,12 @@ elif page == "Tools":
         t_start = tc2[1].date_input("Start Date",
                                     value=parse_date(selected_tool.get("start_date", "")),
                                     key=f"tool_start_{tool_mode}_{edit_tool_idx}")
-        t_renew = tc2[2].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
-        t_paid = tc2[3].checkbox("Paid", value=selected_tool.get("paid", False))
+        t_end = tc2[2].date_input("End Date (blank = ongoing)",
+                                  value=parse_date(selected_tool.get("end_date", "")),
+                                  key=f"tool_end_{tool_mode}_{edit_tool_idx}")
+        t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
+        tc3 = st.columns(4)
+        t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False))
         t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""))
 
         submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
@@ -1234,6 +1500,7 @@ elif page == "Tools":
                     "cost": round(t_cost, 2),
                     "billing_cycle": t_cycle,
                     "start_date": str(t_start) if t_start else "",
+                    "end_date": str(t_end) if t_end else "",
                     "auto_renew": t_renew, "paid": t_paid,
                     "notes": t_notes,
                 }
@@ -1257,10 +1524,10 @@ elif page == "Tools":
             else:
                 st.error("Tool name is required.")
 
-    if tools:
+    if filtered:
         today = date.today()
         tool_data = []
-        for t in tools:
+        for _, t in filtered:
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
             n_users = count_tool_users(D(), t.get("name", ""))
@@ -1275,11 +1542,12 @@ elif page == "Tools":
                 "Vendor": t.get("vendor", ""),
                 "Cost": f"${t.get('cost', 0):,.2f}",
                 "Cycle": t.get("billing_cycle", ""),
-                "Monthly": f"${mc:,.2f}",
+                "Monthly": f"${mc:,.2f}" if t.get("billing_cycle") == "Monthly" else "—",
                 "Annual": f"${ac:,.2f}",
                 "Used by": f"{n_users}" if n_users else "—",
                 "Per project / yr": per_proj,
                 "Start": fmt_date(t.get("start_date", "")),
+                "End": fmt_date(t.get("end_date", "")) if t.get("end_date") else "ongoing",
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
                 "Auto": "Yes" if t.get("auto_renew") else "No",
                 "Paid": "☑" if t.get("paid") else "☐",
@@ -1290,10 +1558,10 @@ elif page == "Tools":
             on_select="rerun", selection_mode="single-row", key="tools_table",
         )
 
-        # Toggle paid / Delete on the selected row
+        # Toggle paid / Delete on the selected row (map back to the real index)
         sel = event.selection.rows
-        if sel and sel[0] < len(tools):
-            i = sel[0]
+        if sel and sel[0] < len(filtered):
+            i = filtered[sel[0]][0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
             if b1.button("Toggle Paid ☐ ↔ ☑"):
@@ -1370,273 +1638,6 @@ elif page == "Tools":
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# CLIENTS
-# ═════════════════════════════════════════════════════════════════════════
-elif page == "Clients":
-    st.title("👤 Clients Info")
-    st.caption("Manage client contact details per project. These fields are available "
-               "as `{{client_*}}` placeholders in the Templates tab.")
-    pr = D()["project_records"]
-
-    # ── Summary table of all projects + client info ───────────────────
-    st.subheader("All Projects")
-    summary = []
-    for name in sorted(pr.keys()):
-        cli = pr[name].get("client", {})
-        summary.append({
-            "Project": name,
-            "Code": pr[name].get("code", ""),
-            "Client Name": cli.get("name", ""),
-            "Company": cli.get("company", ""),
-            "Phone": cli.get("phone", ""),
-            "Email": cli.get("email", ""),
-        })
-    if summary:
-        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
-
-    # ── Per-project editor ────────────────────────────────────────────
-    st.subheader("Edit Client Info")
-    active = st.selectbox("Project", sorted(pr.keys()), key="client_proj")
-    proj = pr[active]
-    cli = proj.setdefault("client", {})
-    for ck in ("name", "position", "company", "address", "phone", "email"):
-        cli.setdefault(ck, "")
-
-    with st.form("client_form"):
-        cc = st.columns(2)
-        c_name = cc[0].text_input("Client Name", value=cli.get("name", ""),
-                                   key="cli_name")
-        c_pos = cc[1].text_input("Position / Title", value=cli.get("position", ""),
-                                  key="cli_pos")
-        cc2 = st.columns(2)
-        c_company = cc2[0].text_input("Company", value=cli.get("company", ""),
-                                       key="cli_company")
-        c_addr = cc2[1].text_input("Address (Street, City, ZIP)",
-                                    value=cli.get("address", ""), key="cli_addr")
-        cc3 = st.columns(2)
-        c_phone = cc3[0].text_input("Phone", value=cli.get("phone", ""),
-                                     key="cli_phone")
-        c_email = cc3[1].text_input("Email", value=cli.get("email", ""),
-                                     key="cli_email")
-
-        if st.form_submit_button("💾 Save Client Info"):
-            cli["name"] = c_name
-            cli["position"] = c_pos
-            cli["company"] = c_company
-            cli["address"] = c_addr
-            cli["phone"] = c_phone
-            cli["email"] = c_email
-            save()
-            st.toast(f"Client info saved for {active}")
-            st.rerun()
-
-    # Show the template placeholders this generates
-    with st.expander("📋 Template placeholders for this client"):
-        ref = [
-            ("{{client_name}}", cli.get("name", "")),
-            ("{{client_position}}", cli.get("position", "")),
-            ("{{client_company}}", cli.get("company", "")),
-            ("{{client_address}}", cli.get("address", "")),
-            ("{{client_phone}}", cli.get("phone", "")),
-            ("{{client_email}}", cli.get("email", "")),
-        ]
-        st.dataframe(pd.DataFrame(ref, columns=["Placeholder", "Value"]),
-                     use_container_width=True, hide_index=True)
-        st.caption("Use these in your .docx template — the Templates tab fills them "
-                   "automatically when you select this project.")
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# TEMPLATES — Fill .docx with project data
-# ═════════════════════════════════════════════════════════════════════════
-elif page == "Templates":
-    st.title("📝 Templates")
-    st.caption("Upload a Word template (.docx) with `{{placeholder}}` tags. "
-               "Pick a project and optionally an invoice/WO record, then fill and download.")
-
-    # ── Step 1: Upload ──────────────────────────────────────────────────
-    uploaded = st.file_uploader("Upload .docx template", type=["docx"],
-                                key="template_upload")
-
-    # ── Step 2: Pick project + record ───────────────────────────────────
-    tc1, tc2 = st.columns(2)
-    tpl_proj = tc1.selectbox("Project", projects_sorted(), key="tpl_proj")
-    flat = flat_invoice_rows(D(), proj_filter=tpl_proj)
-    record_options = ["(None — project summary only)"] + [
-        f"{r['type']} #{r['number']} — ${r['inst_amount']:,.2f} — {r['description']}"
-        for r in flat
-    ]
-    rec_pick = tc2.selectbox("Invoice / WO record", record_options, key="tpl_rec")
-    rec_idx = record_options.index(rec_pick) - 1  # -1 = "None"
-    selected_row = flat[rec_idx] if rec_idx >= 0 else None
-
-    # ── Show current placeholder values ────────────────────────────────
-    mapping = build_placeholder_map(D(), tpl_proj, selected_row)
-    with st.expander("📋 Available placeholders and current values"):
-        ref_rows = []
-        for tag, desc in TEMPLATE_PLACEHOLDERS:
-            ref_rows.append({
-                "Placeholder": tag,
-                "Description": desc,
-                "Current Value": mapping.get(tag, ""),
-            })
-        st.dataframe(pd.DataFrame(ref_rows), use_container_width=True,
-                     hide_index=True, height=600)
-        st.caption("Copy any placeholder above into your .docx template. "
-                   "The app replaces every occurrence with the current value.")
-
-    # ── Step 3: Fill and export ───────────────────────────────────────
-    if uploaded is not None:
-        if st.button("📄 Fill Template", type="primary"):
-            try:
-                from docx import Document
-                import io
-
-                doc = Document(io.BytesIO(uploaded.getvalue()))
-
-                def replace_in_paragraph(para, mapping):
-                    """Join runs, replace all placeholders, redistribute to first run."""
-                    full = "".join(run.text for run in para.runs)
-                    if not any(tag in full for tag in mapping):
-                        return
-                    for tag, val in mapping.items():
-                        full = full.replace(tag, val)
-                    if para.runs:
-                        para.runs[0].text = full
-                        for run in para.runs[1:]:
-                            run.text = ""
-
-                # Body paragraphs
-                for para in doc.paragraphs:
-                    replace_in_paragraph(para, mapping)
-
-                # Tables
-                for table in doc.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            for para in cell.paragraphs:
-                                replace_in_paragraph(para, mapping)
-
-                # Headers and footers
-                for section in doc.sections:
-                    for header_footer in [section.header, section.footer]:
-                        if header_footer is not None:
-                            for para in header_footer.paragraphs:
-                                replace_in_paragraph(para, mapping)
-                            for table in header_footer.tables:
-                                for row in table.rows:
-                                    for cell in row.cells:
-                                        for para in cell.paragraphs:
-                                            replace_in_paragraph(para, mapping)
-
-                # Save filled .docx
-                buf_docx = io.BytesIO()
-                doc.save(buf_docx)
-                buf_docx.seek(0)
-
-                safe_name = tpl_proj.replace(" ", "_")
-                rec_label = f"_{selected_row['number']}" if selected_row else ""
-
-                # Build a PDF from the filled document content
-                from fpdf import FPDF
-
-                pdf = FPDF()
-                pdf.set_auto_page_break(auto=True, margin=20)
-                pdf.add_page()
-                pdf.set_font("Helvetica", size=10)
-
-                def _pdf_safe(text):
-                    """Replace Unicode chars that Helvetica can't encode."""
-                    return (text
-                            .replace("\u2014", "--")   # em-dash
-                            .replace("\u2013", "-")    # en-dash
-                            .replace("\u2018", "'")    # left single quote
-                            .replace("\u2019", "'")    # right single quote
-                            .replace("\u201c", '"')    # left double quote
-                            .replace("\u201d", '"')    # right double quote
-                            .replace("\u2026", "...")   # ellipsis
-                            .replace("\u2022", "*")    # bullet
-                            .replace("\u00a0", " ")    # non-breaking space
-                            .encode("latin-1", errors="replace").decode("latin-1"))
-
-                # Extract filled paragraphs
-                for para in doc.paragraphs:
-                    text = _pdf_safe(para.text.strip())
-                    if not text:
-                        pdf.ln(4)
-                        continue
-                    # Detect heading-like text (short + bold runs)
-                    is_bold = (para.runs and para.runs[0].bold)
-                    if is_bold:
-                        pdf.set_font("Helvetica", style="B", size=11)
-                    else:
-                        pdf.set_font("Helvetica", size=10)
-                    pdf.multi_cell(0, 6, text)
-                    pdf.ln(1)
-
-                # Extract filled tables
-                for table in doc.tables:
-                    pdf.ln(4)
-                    n_cols = len(table.columns)
-                    col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / max(n_cols, 1)
-                    for ri, row in enumerate(table.rows):
-                        # Header row in bold
-                        if ri == 0:
-                            pdf.set_font("Helvetica", style="B", size=9)
-                        else:
-                            pdf.set_font("Helvetica", size=9)
-                        row_h = 6
-                        # Calculate max lines for this row
-                        cell_texts = [_pdf_safe(cell.text.strip().replace("\n", " | "))
-                                      for cell in row.cells]
-                        for ct in cell_texts:
-                            lines = max(1, len(ct) // int(col_w / 2) + 1)
-                            row_h = max(row_h, lines * 5)
-                        for ci, ct in enumerate(cell_texts):
-                            x = pdf.get_x()
-                            y = pdf.get_y()
-                            pdf.rect(x, y, col_w, row_h)
-                            pdf.set_xy(x + 1, y + 1)
-                            pdf.multi_cell(col_w - 2, 5, ct)
-                            pdf.set_xy(x + col_w, y)
-                        pdf.ln(row_h)
-                    pdf.ln(2)
-
-                buf_pdf = io.BytesIO()
-                pdf.output(buf_pdf)
-                buf_pdf.seek(0)
-
-                st.success(f"Filled {sum(1 for t in mapping if mapping[t])} placeholders.")
-
-                # Export buttons side by side
-                st.subheader("Export")
-                ec1, ec2 = st.columns(2)
-                ec1.download_button(
-                    "⬇️ Download .docx",
-                    buf_docx.getvalue(),
-                    f"{safe_name}{rec_label}_filled.docx",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-                ec2.download_button(
-                    "⬇️ Download .pdf",
-                    buf_pdf.getvalue(),
-                    f"{safe_name}{rec_label}_filled.pdf",
-                    "application/pdf",
-                    use_container_width=True,
-                )
-                st.caption("The .docx preserves your template's formatting. "
-                           "The .pdf is a clean export of the filled content.")
-
-            except ImportError as ie:
-                st.error(f"Missing library: {ie}. Check requirements.txt.")
-            except Exception as e:
-                st.error(f"Error filling template: {e}")
-    else:
-        st.info("Upload a .docx template above to get started.")
-
-
-# ═════════════════════════════════════════════════════════════════════════
 # RESULTS — FY COMPARISON
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Results":
@@ -1647,23 +1648,43 @@ elif page == "Results":
     fy_a = c1.selectbox("Compare from (older FY)", choices, index=0, key="res_fy_a")
     fy_b = c2.selectbox("…to (newer FY)", choices,
                         index=len(choices) - 1, key="res_fy_b")
+    mode = st.radio("Comparison", ["All projects (total)", "Per project"],
+                    horizontal=True, key="res_mode")
+
+    fy_year_a = None if fy_a == "All" else int(fy_a.split()[1].split("-")[0])
+    fy_year_b = None if fy_b == "All" else int(fy_b.split()[1].split("-")[0])
+
+    def proj_budget(proj, fy_year):
+        if proj.get("has_budget", False):
+            return None
+        return fy_budget_available(proj, fy_year) if fy_year is not None \
+            else fy_total_budget_added(proj)
+
+    def proj_actuals(proj, fy_year):
+        scope = fy_lines(proj, fy_year) if fy_year is not None else proj["lines"]
+        return sum(actual_personnel_cost(r) + actual_pi_cost(r) + line_value(r, 8)
+                   for r in scope)
 
     def metrics_for(fy):
         proj_count = 0
         budget = 0.0
         credits = 0
+        fy_year = None
+        if fy != "All":
+            try:
+                fy_year = int(fy.split()[1].split("-")[0])
+            except Exception:
+                fy_year = None
         for name, proj in filtered_projects("", fy):
             proj_count += 1
             # has_budget == True means a "No Budget" project, so it's excluded from budget totals
             if not proj.get("has_budget", False):
-                for row in proj["lines"]:
-                    budget += (line_value(row, 9) + line_value(row, 10)
-                               + line_value(row, 11) + line_value(row, 12)
-                               + contracted_travel_cost(row))
-            credits += sum(s["credits"] for s in D()["student_credits"]
-                           if s["project"] == name)
-        sw_rec = D().get("student_workers", {}).get(fy)
-        sw_count = len(sw_rec.get("data", [])) if sw_rec else 0
+                if fy_year is not None:
+                    budget += fy_budget_available(proj, fy_year)
+                else:
+                    budget += fy_total_budget_added(proj)
+            credits += project_credits(D(), fy, name)
+        sw_count = sw_count_for_fy(fy)
         return {"Student Workers": sw_count, "Projects": proj_count,
                 "Budget": budget, "Credits": credits}
 
@@ -1680,38 +1701,98 @@ elif page == "Results":
     st.caption(f"Comparing **{fy_a} → {fy_b}** "
                f"({'same year' if fy_a == fy_b else 'year over year'})")
 
-    # Headline cards (newer FY value, with growth % as the delta arrow)
-    cols = st.columns(4)
-    for col, metric in zip(cols, metric_order):
-        a, b = ma[metric], mb[metric]
-        g = growth(a, b)
-        col.metric(metric, fmt_val(metric, b),
-                   None if g is None else f"{g:+.1f}%")
+    if mode == "All projects (total)":
+        # Headline cards (newer FY value, with growth % as the delta arrow)
+        cols = st.columns(4)
+        for col, metric in zip(cols, metric_order):
+            a, b = ma[metric], mb[metric]
+            g = growth(a, b)
+            col.metric(metric, fmt_val(metric, b),
+                       None if g is None else f"{g:+.1f}%")
 
-    # Detailed table: both years, absolute change, and growth %
-    rows = []
-    for metric in metric_order:
-        a, b = ma[metric], mb[metric]
-        g = growth(a, b)
-        change = b - a
-        if metric == "Budget":
-            sign = "+" if change >= 0 else "−"
-            change_str = f"{sign}${abs(change):,.2f}"
+        # Detailed table: both years, absolute change, and growth %
+        rows = []
+        for metric in metric_order:
+            a, b = ma[metric], mb[metric]
+            g = growth(a, b)
+            change = b - a
+            if metric == "Budget":
+                sign = "+" if change >= 0 else "−"
+                change_str = f"{sign}${abs(change):,.2f}"
+            else:
+                change_str = f"{int(change):+,}"
+            rows.append({
+                "Metric": metric,
+                fy_a: fmt_val(metric, a),
+                fy_b: fmt_val(metric, b),
+                "Change": change_str,
+                "Growth %": "—" if g is None else f"{g:+.1f}%",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("Growth % shows “—” when the older year is 0 (no baseline to divide by). "
+                   "Budget and project count are based on projects active in each FY; "
+                   "credits come from the Credits tab; student workers from the saved table for that FY.")
+
+        csv = pd.DataFrame(rows).to_csv(index=False)
+        st.download_button("⬇️ Download CSV", csv,
+                           f"results_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
+                           "text/csv")
+
+    else:  # ── Per project ──────────────────────────────────────────────
+        names = sorted(
+            n for n, p in D()["project_records"].items()
+            if project_in_fy(p, fy_a) or project_in_fy(p, fy_b)
+        )
+        if not names:
+            st.info("No projects fall within either of the selected fiscal years.")
         else:
-            change_str = f"{int(change):+,}"
-        rows.append({
-            "Metric": metric,
-            fy_a: fmt_val(metric, a),
-            fy_b: fmt_val(metric, b),
-            "Change": change_str,
-            "Growth %": "—" if g is None else f"{g:+.1f}%",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("Growth % shows “—” when the older year is 0 (no baseline to divide by). "
-               "Budget and project count are based on projects active in each FY; "
-               "credits come from the Credits tab; student workers from the saved table for that FY.")
+            tot_ba = tot_bb = tot_aa = tot_ab = 0.0
+            rows = []
+            for name in names:
+                p = D()["project_records"][name]
+                in_a = project_in_fy(p, fy_a)
+                in_b = project_in_fy(p, fy_b)
+                ba = proj_budget(p, fy_year_a) if in_a else None
+                bb = proj_budget(p, fy_year_b) if in_b else None
+                aa = proj_actuals(p, fy_year_a) if in_a else None
+                ab = proj_actuals(p, fy_year_b) if in_b else None
+                if ba is not None:
+                    tot_ba += ba
+                if bb is not None:
+                    tot_bb += bb
+                if aa is not None:
+                    tot_aa += aa
+                if ab is not None:
+                    tot_ab += ab
+                bgr = growth(ba or 0, bb or 0) if (ba is not None and bb is not None) else None
 
-    csv = pd.DataFrame(rows).to_csv(index=False)
-    st.download_button("⬇️ Download CSV", csv,
-                       f"results_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
-                       "text/csv")
+                def money(v):
+                    return "—" if v is None else f"${v:,.2f}"
+                rows.append({
+                    "Project": name,
+                    f"Budget {fy_a}": money(ba),
+                    f"Budget {fy_b}": money(bb),
+                    "Budget Growth %": "—" if bgr is None else f"{bgr:+.1f}%",
+                    f"Actuals {fy_a}": money(aa),
+                    f"Actuals {fy_b}": money(ab),
+                })
+            # Totals row
+            tgr = growth(tot_ba, tot_bb)
+            rows.append({
+                "Project": "— TOTAL —",
+                f"Budget {fy_a}": f"${tot_ba:,.2f}",
+                f"Budget {fy_b}": f"${tot_bb:,.2f}",
+                "Budget Growth %": "—" if tgr is None else f"{tgr:+.1f}%",
+                f"Actuals {fy_a}": f"${tot_aa:,.2f}",
+                f"Actuals {fy_b}": f"${tot_ab:,.2f}",
+            })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("One row per project that falls within either fiscal year. A column "
+                       "shows “—” when the project isn't active in that FY. Budget is that "
+                       "FY's available budget (carried-in + contracted); Actuals is that "
+                       "FY's line-item spend. “No Budget” projects show — for budget.")
+            csv = df.to_csv(index=False)
+            st.download_button("⬇️ Download CSV", csv,
+                               f"results_per_project_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
+                               "text/csv")

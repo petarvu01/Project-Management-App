@@ -55,16 +55,27 @@ def blank_line(name="Phase 1 - Setup"):
 def blank_project(code, name, has_budget=False):
     return {
         "code": code, "has_budget": has_budget,
+        "status": "Active",
         "start_date": "", "end_date": "", "extension_date": "",
         "notes": "", "hours_budget": 0.0, "hours_log": [],
         "contracted_hours": 0.0,
+        "contracted_hours_by_fy": {},
+        "fy_funding": {},
         "assigned_tools": [],
+        "lines_by_fy": {},
         "lines": [blank_line("Phase 1 - Setup"), blank_line("Phase 2 - Core Dev")],
-        "client": {
-            "name": "", "position": "", "company": "",
-            "address": "", "phone": "", "email": "",
-        },
     }
+
+
+def _coerce(v, cast=float):
+    """Best-effort numeric coercion; never raises (0 on failure)."""
+    try:
+        return cast(v)
+    except (TypeError, ValueError):
+        try:
+            return cast(float(v))
+        except (TypeError, ValueError):
+            return cast(0)
 
 
 def validate_line(line):
@@ -78,10 +89,16 @@ def validate_line(line):
             line.append(0.0)
     while len(line) < 14:
         line.append(0.0)
+    line = line[:14]
+    # Coerce field types so downstream math never crashes on stray/blank text.
+    line[0] = "" if line[0] is None else str(line[0])
+    line[1] = _coerce(line[1], int)
+    for i in (2, 3, 4, 5, 8, 9, 10, 11, 12, 13):
+        line[i] = _coerce(line[i], float)
     # Legacy actual indirect/fringe are no longer used.
     line[6] = 0.0
     line[7] = 0.0
-    return line[:14]
+    return line
 
 
 def default_data():
@@ -192,22 +209,82 @@ def _write_local(data: dict):
 
 def _normalize(data: dict) -> dict:
     """Apply field defaults and per-line migrations to a loaded data dict."""
+    # Re-key student-worker tables to the canonical FY label, so older keys
+    # (e.g. "FY 2025-26") adopt the current label format automatically and
+    # idempotently. The year is parsed from the 2nd token, which is unchanged.
+    sw = data.get("student_workers")
+    if isinstance(sw, dict) and sw:
+        fixed = {}
+        for label, rec in sw.items():
+            try:
+                y = int(str(label).split()[1].split("-")[0])
+                fixed[fy_label(y)] = rec
+            except Exception:
+                fixed[label] = rec
+        data["student_workers"] = fixed
+
+    # Per-FY student credits. Migrate an old flat list into a fiscal-year bucket
+    # (the current FY), then re-key everything to the canonical label and keep a
+    # flattened "student_credits" view so whole-dataset totals keep working.
+    scbf = data.get("student_credits_by_fy")
+    if not isinstance(scbf, dict):
+        flat = data.get("student_credits", []) or []
+        scbf = {fy_label(date_to_fy(date.today())): flat} if flat else {}
+    fixed_c = {}
+    for label, recs in scbf.items():
+        try:
+            y = int(str(label).split()[1].split("-")[0])
+            fixed_c[fy_label(y)] = recs or []
+        except Exception:
+            fixed_c[label] = recs or []
+    data["student_credits_by_fy"] = fixed_c
+    data["student_credits"] = [r for recs in fixed_c.values() for r in recs]
+
+    # Tools: collapse the old cycles (Annual/2-Year/anything) into the
+    # two-cycle model. Only "Monthly" stays monthly; everything else is one-time.
+    for t in data.get("tools", []) or []:
+        if t.get("billing_cycle") != "Monthly":
+            t["billing_cycle"] = "One-time"
+
     pr = data.get("project_records", {})
     for proj in pr.values():
         for key, default in [("notes",""), ("start_date",""), ("end_date",""),
                               ("extension_date",""), ("hours_budget",0.0),
-                              ("hours_log",[]), ("assigned_tools",[])]:
+                              ("hours_log",[]), ("assigned_tools",[]),
+                              ("status","Active"), ("fy_funding",{}),
+                              ("lines_by_fy",{}), ("contracted_hours_by_fy",{})]:
             proj.setdefault(key, default)
         # Migrate old Hours-tab project-level budget into the new contracted_hours field.
         if "contracted_hours" not in proj:
             proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
-        proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
-        if not proj["lines"]:
-            proj["lines"] = [blank_line()]
-        # Client info defaults
-        cli = proj.setdefault("client", {})
-        for ck in ("name", "position", "company", "address", "phone", "email"):
-            cli.setdefault(ck, "")
+        # Per-FY line items: if not yet split by FY, move existing flat lines
+        # under the project's primary fiscal year (one-time migration).
+        if not proj.get("lines_by_fy"):
+            existing = [validate_line(l) for l in proj.get("lines", [])]
+            if not existing:
+                existing = [blank_line()]
+            proj["lines_by_fy"] = {str(project_primary_fy(proj)): existing}
+        else:
+            proj["lines_by_fy"] = {
+                str(y): [validate_line(l) for l in (rows or [])]
+                for y, rows in proj["lines_by_fy"].items()
+            }
+        # Keep the flat "lines" list as a synced view of every FY (so all the
+        # whole-project totals that read proj["lines"] keep working unchanged).
+        proj["lines"] = flatten_lines(proj) or [blank_line()]
+        # Per-FY contracted hours: migrate from last round's fy_funding hours,
+        # then from the legacy project-level contracted_hours, one time only.
+        if not proj.get("contracted_hours_by_fy"):
+            chf = {}
+            for y, e in (proj.get("fy_funding") or {}).items():
+                h = float((e or {}).get("hours_added") or 0)
+                if h:
+                    chf[str(y)] = h
+            if not chf:
+                legacy = float(proj.get("contracted_hours", 0.0) or 0)
+                if legacy:
+                    chf[str(project_primary_fy(proj))] = legacy
+            proj["contracted_hours_by_fy"] = chf
     data["project_records"] = pr
     data.setdefault("student_credits", [])
     data.setdefault("invoices", [])
@@ -294,8 +371,8 @@ def compute_master_totals(data: dict) -> dict:
         for row in proj["lines"]:
             total_stu += int(row[1]) * float(row[2]) * float(row[3])
             total_pi  += float(row[4]) * float(row[5])
-            if not is_red:
-                total_budget += float(row[9]) + float(row[10]) + float(row[11]) + float(row[12]) + float(row[13])
+        if not is_red:
+            total_budget += fy_total_budget_added(proj)
     return {
         "active_projects":     len(pr),
         "total_budget":        total_budget,
@@ -311,13 +388,17 @@ def project_contracted_total(proj: dict) -> float:
 
 
 def project_hours_summary(proj: dict):
-    """Return (budget, deducted) hours for a project.
+    """Return (budget, deducted) hours for a project, whole-project totals.
 
-    Budget   = project-level contracted_hours (annual).
-    Deducted = sum over lines of (Students × Stu Hours) + PI Hours.
-               Many students can each log hours; PI is a single person.
+    Budget   = sum of per-FY contracted hours (falls back to legacy
+               project-level contracted_hours during migration).
+    Deducted = sum over all lines of (Students × Stu Hours) + PI Hours.
     """
-    budget = float(proj.get("contracted_hours", 0.0))
+    chf = proj.get("contracted_hours_by_fy") or {}
+    if chf:
+        budget = sum(float(v or 0) for v in chf.values())
+    else:
+        budget = float(proj.get("contracted_hours", 0.0))
     deducted = 0.0
     for r in proj.get("lines", []):
         try:
@@ -328,6 +409,187 @@ def project_hours_summary(proj: dict):
         except (TypeError, ValueError):
             pass
     return budget, deducted
+
+
+# ─── Per-FY line items + budget (carry-over) ─────────────────────────────
+# Line items are stored per fiscal year:  proj["lines_by_fy"] = {"2026": [...]}
+# proj["lines"] is kept as the flattened view of every FY's lines.
+#
+# BUDGET for a FY = the contracted columns of that FY's line items
+#   (Cont. Personnel + PI + Indirect + Fringe + Travel).
+# SPENT for a FY  = that FY's actual costs (Personnel + PI + actual Travel).
+# Leftover (Available - Spent) carries into the next FY automatically once the
+# FY has ended (after May 31).  Carry-in is DERIVED, never stored, so the whole
+# ledger is always re-computable and never double-counts.
+#
+# Contracted HOURS are set per FY in proj["contracted_hours_by_fy"] = {"2026": 100}.
+
+def _fy_ended(year: int) -> bool:
+    """True once fiscal year (Jun 1 of `year` → May 31 of year+1) is over."""
+    try:
+        return date.today() > date(year + 1, 5, 31)
+    except Exception:
+        return False
+
+
+def project_primary_fy(proj: dict) -> int:
+    """The FY a project 'belongs' to by default (used to migrate old data)."""
+    for ds in (proj.get("start_date", ""), proj.get("end_date", ""),
+               proj.get("extension_date", "")):
+        d = parse_date(ds)
+        if d:
+            return date_to_fy(d)
+    return date_to_fy(date.today())
+
+
+def lines_by_fy(proj: dict) -> dict:
+    return proj.setdefault("lines_by_fy", {})
+
+
+def flatten_lines(proj: dict) -> list:
+    lbf = proj.get("lines_by_fy") or {}
+    out = []
+    for y in sorted(lbf, key=lambda k: int(k)):
+        out.extend(lbf[y])
+    return out
+
+
+def fy_lines(proj: dict, year) -> list:
+    return (proj.get("lines_by_fy") or {}).get(str(year), [])
+
+
+def _contracted_travel(r) -> float:
+    """Contracted travel = row[13], falling back to old row[8] if blank."""
+    try:
+        v = float(r[13])
+    except Exception:
+        v = 0.0
+    if v == 0.0:
+        try:
+            v = float(r[8])
+        except Exception:
+            v = 0.0
+    return v
+
+
+def fy_contracted_budget(proj: dict, year) -> float:
+    """Budget for one FY = contracted Personnel + PI + Indirect + Fringe + Travel."""
+    total = 0.0
+    for r in fy_lines(proj, year):
+        r = validate_line(r)
+        total += float(r[9]) + float(r[10]) + float(r[11]) + float(r[12]) + _contracted_travel(r)
+    return total
+
+
+def fy_actual_spend(proj: dict, year) -> float:
+    """Actual spend for a FY: personnel + PI + actual travel from its lines."""
+    total = 0.0
+    for r in fy_lines(proj, year):
+        r = validate_line(r)
+        total += int(r[1]) * float(r[2]) * float(r[3])   # students × rate × hrs
+        total += float(r[4]) * float(r[5])               # PI rate × PI hrs
+        total += float(r[8])                             # actual travel
+    return total
+
+
+def fy_contracted_hours(proj: dict, year) -> float:
+    return float((proj.get("contracted_hours_by_fy") or {}).get(str(year), 0) or 0)
+
+
+def fy_hours_spend(proj: dict, year) -> float:
+    """Hours deducted for a FY: (students × stu hrs) + PI hrs from its lines."""
+    total = 0.0
+    for r in fy_lines(proj, year):
+        r = validate_line(r)
+        total += int(r[1]) * float(r[3]) + float(r[5])
+    return total
+
+
+def _fy_year_set(proj: dict):
+    years = set(int(k) for k in (proj.get("lines_by_fy") or {}))
+    years |= set(int(k) for k in (proj.get("contracted_hours_by_fy") or {}))
+    return years
+
+
+def fy_funding_rows(proj: dict) -> list:
+    """Derived per-FY rows, ascending by year.
+
+    Row keys: year, carried_in, added (= contracted budget), available, spent,
+    remaining, and the h_* hours equivalents.  Leftover (remaining) flows into
+    the next FY's carried_in once the FY has ended.
+    """
+    rows = []
+    prev_year = None
+    prev_rem = 0.0
+    prev_hrem = 0.0
+    for y in sorted(_fy_year_set(proj)):
+        added = fy_contracted_budget(proj, y)
+        hadded = fy_contracted_hours(proj, y)
+        # Running balance: leftover from the previous year always carries into
+        # this one (so the next FY shows the carry-in immediately, not only
+        # after the prior year ends on May 31).
+        if prev_year is not None:
+            cin, hcin = prev_rem, prev_hrem
+        else:
+            cin, hcin = 0.0, 0.0
+        avail = cin + added
+        havail = hcin + hadded
+        spent = fy_actual_spend(proj, y)
+        hspent = fy_hours_spend(proj, y)
+        rem = avail - spent
+        hrem = havail - hspent
+        rows.append({
+            "year": y, "carried_in": cin, "added": added, "available": avail,
+            "spent": spent, "remaining": rem,
+            "h_carried_in": hcin, "h_added": hadded, "h_available": havail,
+            "h_spent": hspent, "h_remaining": hrem,
+        })
+        prev_year, prev_rem, prev_hrem = y, rem, hrem
+    return rows
+
+
+def fy_carry_in_for(proj: dict, year: int) -> tuple:
+    """($ carry-in, hours carry-in) for a FY. If the year already exists in the
+    ledger its computed carry-in is authoritative; otherwise carry the leftover
+    of the most recent earlier year that has data (running balance)."""
+    rows = fy_funding_rows(proj)
+    for r in rows:
+        if r["year"] == int(year):
+            return r["carried_in"], r["h_carried_in"]
+    prior = [r for r in rows if r["year"] < int(year)]
+    if prior:
+        last = prior[-1]
+        return last["remaining"], last["h_remaining"]
+    return 0.0, 0.0
+
+
+def fy_budget_available(proj: dict, year) -> float:
+    """Budget available for one FY = carried-in + contracted budget."""
+    for r in fy_funding_rows(proj):
+        if r["year"] == int(year):
+            return r["available"]
+    return fy_carry_in_for(proj, int(year))[0]
+
+
+def fy_hours_available(proj: dict, year) -> float:
+    for r in fy_funding_rows(proj):
+        if r["year"] == int(year):
+            return r["h_available"]
+    return fy_carry_in_for(proj, int(year))[1]
+
+
+def fy_hours_summary(proj: dict, year) -> tuple:
+    """(available, spent, remaining) contracted hours for one FY."""
+    cin_h = fy_carry_in_for(proj, int(year))[1]
+    avail = cin_h + fy_contracted_hours(proj, year)
+    spent = fy_hours_spend(proj, year)
+    return avail, spent, avail - spent
+
+
+def fy_total_budget_added(proj: dict) -> float:
+    """Total contracted budget across all FYs (for the 'All' filter); equals
+    the whole-project contracted total and does not double-count carry-over."""
+    return sum(fy_contracted_budget(proj, y) for y in _fy_year_set(proj))
 
 
 def count_tool_users(data: dict, tool_name: str) -> int:
@@ -596,6 +858,65 @@ def project_in_fy(proj: dict, label: str) -> bool:
     return False
 
 
+def tool_in_fy(tool: dict, label: str) -> bool:
+    """Whether a tool/subscription is active in the given fiscal year.
+    A tool with no end date is treated as ongoing from its start date onward;
+    a tool with no start date shows in every FY."""
+    if label == "All":
+        return True
+    fy_s, fy_e = fy_range(label)
+    if not fy_s:
+        return True
+    t_start = parse_date(tool.get("start_date", ""))
+    t_end = parse_date(tool.get("end_date", ""))
+    if not t_start:
+        return True
+    if t_start > fy_e:
+        return False
+    if t_end is None:
+        return True
+    return t_end >= fy_s
+
+
+def _fy_year_of(label) -> int:
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def credits_for_fy(data: dict, label: str) -> list:
+    """Credit records for a fiscal year (matched by year so label format doesn't
+    matter). 'All' returns every FY's records combined."""
+    scbf = data.get("student_credits_by_fy", {}) or {}
+    if label == "All":
+        return [r for recs in scbf.values() for r in recs]
+    target = _fy_year_of(label)
+    out = []
+    for key, recs in scbf.items():
+        if _fy_year_of(key) == target:
+            out.extend(recs or [])
+    return out
+
+
+def project_credits(data: dict, label: str, project: str) -> float:
+    return sum(float(r.get("credits", 0) or 0)
+               for r in credits_for_fy(data, label) if r.get("project") == project)
+
+
+def set_credits_for_fy(data: dict, label: str, records: list):
+    """Replace one fiscal year's credit records (stored under the canonical
+    label) and keep the flattened student_credits view in sync."""
+    scbf = data.setdefault("student_credits_by_fy", {})
+    y = _fy_year_of(label)
+    key = fy_label(y) if y is not None else label
+    for k in list(scbf.keys()):
+        if _fy_year_of(k) == y:
+            del scbf[k]
+    scbf[key] = records
+    data["student_credits"] = [r for recs in scbf.values() for r in recs]
+
+
 # ─── Overview KPIs (predefined, user-selectable) ──────────────────────────
 # Ordered (key, label) pairs — this is the menu users pick from.
 KPI_OPTIONS = [
@@ -640,9 +961,13 @@ def compute_kpis(data: dict) -> dict:
                 _, a = tool_share_costs(data, t, name)
                 actuals += a
 
-    cont_hours = sum(float(p.get("contracted_hours", 0) or 0) for p in pr.values())
-    hours_deducted = sum(project_hours_summary(p)[1] for p in pr.values()
-                         if float(p.get("contracted_hours", 0) or 0) > 0)
+    cont_hours = 0.0
+    hours_deducted = 0.0
+    for p in pr.values():
+        b, ded = project_hours_summary(p)
+        cont_hours += b
+        if b > 0:
+            hours_deducted += ded
 
     rows = flat_invoice_rows(data)
     unpaid = [r for r in rows if not r["paid"]]
@@ -677,114 +1002,3 @@ def compute_kpis(data: dict) -> dict:
         "tools_annual":         f"${tools_annual:,.2f}",
         "students_count":       f"{len(data.get('student_credits', []))}",
     }
-
-
-# ─── Template placeholder engine ─────────────────────────────────────────
-TEMPLATE_PLACEHOLDERS = [
-    # ── Project fields ──
-    ("{{project_name}}",        "Project name"),
-    ("{{project_code}}",        "Project code (e.g. I0850)"),
-    ("{{start_date}}",          "Project start date"),
-    ("{{end_date}}",            "Project end date"),
-    ("{{extension_date}}",      "Extension date (blank if none)"),
-    # ── Client info ──
-    ("{{client_name}}",         "Client contact name"),
-    ("{{client_position}}",     "Client position / title"),
-    ("{{client_company}}",      "Client company name"),
-    ("{{client_address}}",      "Client address (street, city, zip)"),
-    ("{{client_phone}}",        "Client phone number"),
-    ("{{client_email}}",        "Client email address"),
-    # ── Current date ──
-    ("{{current_date}}",        "Today's date (e.g. Jun 17, 2026)"),
-    ("{{current_date_iso}}",    "Today's date ISO (2026-06-17)"),
-    # ── Hours (project-level) ──
-    ("{{contracted_hours}}",    "Annual contracted hours budget"),
-    ("{{hours_deducted}}",      "Total hours deducted (all lines)"),
-    ("{{hours_remaining}}",     "Remaining hours (budget − deducted)"),
-    # ── Financial (project-level) ──
-    ("{{contracted_total}}",    "Total contracted $ budget (all lines)"),
-    ("{{total_invoiced}}",      "Sum of all invoice/WO amounts for this project"),
-    ("{{total_paid}}",          "Sum of paid invoice/WO amounts"),
-    ("{{outstanding_balance}}", "Invoiced but unpaid (total_invoiced − total_paid)"),
-    ("{{budget_remaining}}",    "Contracted $ − total invoiced"),
-    # ── Selected invoice / WO record ──
-    ("{{record_type}}",         "Invoice or Work Order"),
-    ("{{record_number}}",       "Invoice/WO number"),
-    ("{{record_amount}}",       "This record's amount ($)"),
-    ("{{record_description}}",  "Description / period label"),
-    ("{{record_date}}",         "Invoice date"),
-    ("{{record_net_terms}}",    "Net terms (e.g. Net 30)"),
-    ("{{record_payment_due}}",  "Payment due date"),
-    ("{{record_sent}}",         "Sent status (Yes / No)"),
-    ("{{record_paid}}",         "Paid status (Yes / No)"),
-    ("{{record_hours_deducted}}","Hours deducted field (invoices only)"),
-    # ── WO-specific ──
-    ("{{wo_total}}",            "Full Work Order total (all installments)"),
-]
-
-
-def build_placeholder_map(data: dict, proj_name: str,
-                          flat_row: dict = None) -> dict:
-    """Build a {placeholder: value} mapping for a given project and optional
-    invoice/WO row (as returned by flat_invoice_rows)."""
-    proj = data.get("project_records", {}).get(proj_name, {})
-    today = date.today()
-
-    # Project
-    ext = proj.get("extension_date", "")
-    end = proj.get("end_date", "")
-    cli = proj.get("client", {})
-    m = {
-        "{{project_name}}":      proj_name,
-        "{{project_code}}":      proj.get("code", ""),
-        "{{start_date}}":        fmt_date(proj.get("start_date", "")),
-        "{{end_date}}":          fmt_date(end),
-        "{{extension_date}}":    fmt_date(ext) if ext else "",
-        "{{client_name}}":       cli.get("name", ""),
-        "{{client_position}}":   cli.get("position", ""),
-        "{{client_company}}":    cli.get("company", ""),
-        "{{client_address}}":    cli.get("address", ""),
-        "{{client_phone}}":      cli.get("phone", ""),
-        "{{client_email}}":      cli.get("email", ""),
-        "{{current_date}}":      today.strftime("%b %d, %Y"),
-        "{{current_date_iso}}":  today.strftime("%Y-%m-%d"),
-    }
-
-    # Hours
-    ch = float(proj.get("contracted_hours", 0) or 0)
-    _, hrs_ded = project_hours_summary(proj)
-    m["{{contracted_hours}}"]  = f"{ch:,.1f}"
-    m["{{hours_deducted}}"]    = f"{hrs_ded:,.1f}"
-    m["{{hours_remaining}}"]   = f"{ch - hrs_ded:,.1f}"
-
-    # Financial
-    contracted = project_contracted_total(proj)
-    rows = flat_invoice_rows(data, proj_filter=proj_name)
-    total_inv = sum(r["inst_amount"] for r in rows)
-    total_paid_amt = sum(r["inst_amount"] for r in rows if r["paid"])
-    m["{{contracted_total}}"]    = f"${contracted:,.2f}"
-    m["{{total_invoiced}}"]      = f"${total_inv:,.2f}"
-    m["{{total_paid}}"]          = f"${total_paid_amt:,.2f}"
-    m["{{outstanding_balance}}"] = f"${total_inv - total_paid_amt:,.2f}"
-    m["{{budget_remaining}}"]    = f"${contracted - total_inv:,.2f}"
-
-    # Selected record
-    if flat_row:
-        m["{{record_type}}"]          = flat_row.get("type", "")
-        m["{{record_number}}"]        = flat_row.get("number", "")
-        m["{{record_amount}}"]        = f"${flat_row.get('inst_amount', 0):,.2f}"
-        m["{{record_description}}"]   = flat_row.get("description", "")
-        m["{{record_date}}"]          = fmt_date(flat_row.get("due_date", ""))
-        m["{{record_net_terms}}"]     = flat_row.get("net_terms", "")
-        m["{{record_payment_due}}"]   = fmt_date(flat_row.get("payment_due", ""))
-        m["{{record_sent}}"]          = "Yes" if flat_row.get("sent") else "No"
-        m["{{record_paid}}"]          = "Yes" if flat_row.get("paid") else "No"
-        m["{{record_hours_deducted}}"]= str(flat_row.get("hours_deducted", ""))
-        m["{{wo_total}}"]             = (f"${flat_row.get('wo_total', 0):,.2f}"
-                                         if flat_row.get("type") == "Work Order" else "")
-    else:
-        for tag, _ in TEMPLATE_PLACEHOLDERS:
-            if tag.startswith("{{record_") or tag == "{{wo_total}}":
-                m.setdefault(tag, "")
-
-    return m
