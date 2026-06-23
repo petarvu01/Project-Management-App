@@ -19,7 +19,8 @@ from data import (load_data, save_data, blank_project, blank_line,
                   fy_contracted_budget, fy_contracted_hours, fy_hours_summary,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
-                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS, kpi_fy_options)
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS, kpi_fy_options,
+                  build_fy_report)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -361,7 +362,6 @@ if page == "Overview":
     scope_txt = overview_fy if overview_fy != "All" else "all fiscal years"
     if rc1.button(f"🖨️ Generate PDF summary"):
         try:
-            from report import build_fy_report
             st.session_state["fy_report"] = (overview_fy, build_fy_report(D(), overview_fy))
         except Exception as e:
             st.session_state.pop("fy_report", None)

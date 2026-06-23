@@ -8,6 +8,13 @@ from pathlib import Path
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      fy_range, calc_payment_due, calc_renewal_date, calc_tool_costs)
 
+try:                       # PDF report support (fpdf2 is in requirements.txt)
+    from fpdf import FPDF
+    _HAS_FPDF = True
+except Exception:          # keep data.py importable even if the lib is missing
+    FPDF = object
+    _HAS_FPDF = False
+
 DATA_FILE = Path(__file__).parent / "dashboard_progress.json"
 GIST_FILENAME = "dashboard_progress.json"
 MAX_BACKUPS = 10
@@ -1117,3 +1124,317 @@ def compute_kpis(data: dict, fy: str = "All") -> dict:
         "tools_annual":         f"${tools_annual:,.2f}",
         "students_count":       f"{students_count}",
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# FISCAL-YEAR PDF SUMMARY REPORT
+# build_fy_report(data, fy_label_str) -> bytes. All dependencies above are
+# in-module; FPDF is imported lazily/guarded so importing data.py never fails.
+# ═════════════════════════════════════════════════════════════════════════
+_RPT_PAGE_W = 190.0
+_RPT_INK = (30, 41, 59)
+_RPT_MUTED = (100, 116, 139)
+_RPT_ACCENT = (22, 163, 74)
+_RPT_LINE = (203, 213, 225)
+_RPT_ZEBRA = (241, 245, 249)
+
+
+def _rpt_year_of(label):
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def _rpt_s(v) -> str:
+    """Make any value safe for the core (latin-1) PDF fonts."""
+    s = str(v)
+    repl = {"\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+            "\u201c": '"', "\u201d": '"', "\u2022": "*", "\u2260": "!=",
+            "\u2192": "->", "\u2026": "...", "\u00a0": " "}
+    for k, val in repl.items():
+        s = s.replace(k, val)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def _rpt_money(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _rpt_hrs(x) -> str:
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return "0"
+
+
+def _rpt_pct(used, avail) -> str:
+    try:
+        return f"{(used / avail * 100):.0f}%" if avail else "-"
+    except Exception:
+        return "-"
+
+
+class _FYReport(FPDF):
+    def __init__(self, scope_label):
+        super().__init__(orientation="P", unit="mm", format="A4")
+        self.scope_label = scope_label
+        self.set_auto_page_break(auto=True, margin=14)
+        self.set_margins(10, 12, 10)
+
+    def footer(self):
+        self.set_y(-12)
+        self.set_font("helvetica", "", 8)
+        self.set_text_color(*_RPT_MUTED)
+        self.cell(0, 6, _rpt_s(f"PM Dashboard  -  {self.scope_label}"), align="L")
+        self.cell(0, 6, _rpt_s(f"Page {self.page_no()}/{{nb}}"), align="R")
+
+    def h1(self, text):
+        self.set_font("helvetica", "B", 18)
+        self.set_text_color(*_RPT_INK)
+        self.cell(0, 10, _rpt_s(text), new_x="LMARGIN", new_y="NEXT")
+
+    def h2(self, text):
+        self.ln(3)
+        self.set_font("helvetica", "B", 12)
+        self.set_text_color(*_RPT_ACCENT)
+        self.cell(0, 7, _rpt_s(text), new_x="LMARGIN", new_y="NEXT")
+        self.set_draw_color(*_RPT_LINE)
+        self.set_line_width(0.3)
+        yy = self.get_y()
+        self.line(10, yy, 10 + _RPT_PAGE_W, yy)
+        self.ln(1.5)
+
+    def caption(self, text):
+        self.set_font("helvetica", "", 9)
+        self.set_text_color(*_RPT_MUTED)
+        self.multi_cell(0, 5, _rpt_s(text))
+        self.ln(0.5)
+
+    def kpi_grid(self, pairs, cols=3):
+        gap = 3
+        cw = (_RPT_PAGE_W - gap * (cols - 1)) / cols
+        ch = 15
+        for i, (label, value) in enumerate(pairs):
+            col = i % cols
+            if col == 0:
+                self._row_y = self.get_y()
+                if self._row_y + ch > self.page_break_trigger:
+                    self.add_page()
+                    self._row_y = self.get_y()
+            x = 10 + col * (cw + gap)
+            self.set_xy(x, self._row_y)
+            self.set_draw_color(*_RPT_LINE)
+            self.set_fill_color(*_RPT_ZEBRA)
+            self.set_line_width(0.2)
+            self.rect(x, self._row_y, cw, ch, style="DF")
+            self.set_xy(x + 2.5, self._row_y + 2.5)
+            self.set_font("helvetica", "", 8)
+            self.set_text_color(*_RPT_MUTED)
+            self.cell(cw - 5, 4, _rpt_s(label.upper()))
+            self.set_xy(x + 2.5, self._row_y + 7)
+            self.set_font("helvetica", "B", 13)
+            self.set_text_color(*_RPT_INK)
+            self.cell(cw - 5, 6, _rpt_s(value))
+            if col == cols - 1:
+                self.set_y(self._row_y + ch + gap)
+        if len(pairs) % cols != 0:
+            self.set_y(self._row_y + ch + gap)
+
+    def table(self, headers, widths, rows, aligns=None, totals=None):
+        aligns = aligns or ["L"] * len(headers)
+
+        def _header():
+            self.set_font("helvetica", "B", 9)
+            self.set_fill_color(*_RPT_INK)
+            self.set_text_color(255, 255, 255)
+            for h, w, a in zip(headers, widths, aligns):
+                self.cell(w, 7, _rpt_s(h), border=0, align=a, fill=True)
+            self.ln()
+
+        _header()
+        self.set_font("helvetica", "", 9)
+        self.set_text_color(*_RPT_INK)
+        fill = False
+        for row in rows:
+            if self.get_y() + 6 > self.page_break_trigger:
+                self.add_page()
+                _header()
+                self.set_font("helvetica", "", 9)
+                self.set_text_color(*_RPT_INK)
+            self.set_fill_color(*_RPT_ZEBRA)
+            for cell, w, a in zip(row, widths, aligns):
+                self.cell(w, 6, _rpt_s(cell), border=0, align=a, fill=fill)
+            self.ln()
+            fill = not fill
+        if totals:
+            self.set_font("helvetica", "B", 9)
+            self.set_fill_color(*_RPT_ZEBRA)
+            for cell, w, a in zip(totals, widths, aligns):
+                self.cell(w, 6.5, _rpt_s(cell), border="T", align=a, fill=True)
+            self.ln()
+        self.ln(2)
+
+
+def _rpt_whole_project_actual(proj) -> float:
+    total = 0.0
+    for r in proj.get("lines", []):
+        try:
+            total += int(r[1]) * float(r[2]) * float(r[3])
+            total += float(r[4]) * float(r[5])
+            total += float(r[8])
+        except (TypeError, ValueError, IndexError):
+            pass
+    return total
+
+
+def build_fy_report(data: dict, fy: str = "All") -> bytes:
+    """Printable PDF summary of results for one fiscal year (or all years when
+    fy == 'All'). Returns PDF bytes. Raises RuntimeError if fpdf2 is missing."""
+    if not _HAS_FPDF:
+        raise RuntimeError("PDF support requires the 'fpdf2' package "
+                           "(add fpdf2 to requirements.txt).")
+
+    y = _rpt_year_of(fy) if fy != "All" else None
+    scoped = y is not None
+    eff_fy = fy if scoped else "All"
+    scope_label = fy if scoped else "All fiscal years"
+
+    pdf = _FYReport(scope_label)
+    pdf.alias_nb_pages()
+    pdf.add_page()
+
+    pdf.h1("Project Management Summary")
+    pdf.set_font("helvetica", "", 11)
+    pdf.set_text_color(*_RPT_MUTED)
+    pdf.cell(0, 6, _rpt_s(f"Fiscal year: {scope_label}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _rpt_s(f"Generated: {date.today().strftime('%b %d, %Y')}"),
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    kpis = compute_kpis(data, fy=eff_fy)
+    headline_keys = ["active_projects", "total_credits", "total_budget",
+                     "total_actuals", "total_cont_hours", "total_hours_deducted",
+                     "hours_remaining", "unpaid_amount", "tools_annual"]
+    label_map = dict(KPI_OPTIONS)
+    pdf.h2("Key metrics")
+    pdf.kpi_grid([(label_map.get(k, k), kpis.get(k, "-")) for k in headline_keys], cols=3)
+
+    pr = data.get("project_records", {})
+
+    # Projects: budget
+    pdf.h2("Projects - Budget")
+    rows, t_avail, t_spent = [], 0.0, 0.0
+    for name in sorted(pr):
+        proj = pr[name]
+        if scoped:
+            if not project_in_fy(proj, eff_fy):
+                continue
+            avail = fy_budget_available(proj, y)
+            spent = fy_actual_spend(proj, y)
+        else:
+            avail = project_contracted_total(proj)
+            spent = _rpt_whole_project_actual(proj)
+        if avail == 0 and spent == 0:
+            continue
+        rows.append([name, proj.get("status", "Active"), _rpt_money(avail),
+                     _rpt_money(spent), _rpt_money(avail - spent), _rpt_pct(spent, avail)])
+        t_avail += avail
+        t_spent += spent
+    if rows:
+        pdf.table(["Project", "Status", "Budget", "Spent", "Remaining", "% Used"],
+                  [60, 25, 28, 28, 28, 21], rows,
+                  aligns=["L", "L", "R", "R", "R", "R"],
+                  totals=["Total", "", _rpt_money(t_avail), _rpt_money(t_spent),
+                          _rpt_money(t_avail - t_spent), _rpt_pct(t_spent, t_avail)])
+    else:
+        pdf.caption("No project budget activity for this fiscal year.")
+
+    # Projects: hours
+    pdf.h2("Projects - Hours")
+    hrows, h_avail, h_used = [], 0.0, 0.0
+    for name in sorted(pr):
+        proj = pr[name]
+        if scoped:
+            if not project_in_fy(proj, eff_fy):
+                continue
+            avail, used, _rem = fy_hours_summary(proj, y)
+        else:
+            avail, used = project_hours_summary(proj)
+        if avail <= 0:
+            continue
+        hrows.append([name, _rpt_hrs(avail), _rpt_hrs(used),
+                      _rpt_hrs(avail - used), _rpt_pct(used, avail)])
+        h_avail += avail
+        h_used += used
+    if hrows:
+        pdf.table(["Project", "Available", "Used", "Remaining", "% Used"],
+                  [70, 30, 30, 30, 30], hrows,
+                  aligns=["L", "R", "R", "R", "R"],
+                  totals=["Total", _rpt_hrs(h_avail), _rpt_hrs(h_used),
+                          _rpt_hrs(h_avail - h_used), _rpt_pct(h_used, h_avail)])
+    else:
+        pdf.caption("No projects with contracted hours for this fiscal year.")
+
+    # Invoices / Work Orders
+    pdf.h2("Invoices & Work Orders")
+    inv_rows = []
+    for r in flat_invoice_rows(data):
+        if scoped:
+            d0 = parse_date(r["due_date"])
+            if not (d0 and date_to_fy(d0) == y):
+                continue
+        inv_rows.append(r)
+    total_billed = sum(r["inst_amount"] for r in inv_rows)
+    unpaid = [r for r in inv_rows if not r["paid"]]
+    unpaid_amt = sum(r["inst_amount"] for r in unpaid)
+    today = date.today()
+
+    def _due(r):
+        return parse_date(r["payment_due"]) or parse_date(r["due_date"])
+
+    overdue = [r for r in unpaid if _due(r) and _due(r) < today]
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_text_color(*_RPT_INK)
+    pdf.multi_cell(0, 5.5, _rpt_s(
+        f"Records: {len(inv_rows)}    Billed: {_rpt_money(total_billed)}    "
+        f"Unpaid: {len(unpaid)} ({_rpt_money(unpaid_amt)})    Overdue: {len(overdue)}"))
+    pdf.ln(1)
+    show = sorted(unpaid, key=lambda r: (_due(r) or date.max))
+    if show:
+        pdf.caption("Outstanding items (unpaid), earliest due first:")
+        irows = []
+        for r in show[:25]:
+            due = _due(r)
+            od = "OVERDUE" if (due and due < today) else "due"
+            irows.append([r["type"], r["number"], r["project"],
+                          _rpt_money(r["inst_amount"]), fmt_date(r["due_date"]), od])
+        pdf.table(["Type", "Number", "Project", "Amount", "Due", "Status"],
+                  [24, 28, 50, 28, 30, 30], irows,
+                  aligns=["L", "L", "L", "R", "L", "L"])
+        if len(show) > 25:
+            pdf.caption(f"... and {len(show) - 25} more outstanding item(s).")
+    else:
+        pdf.caption("No outstanding invoices or work orders for this fiscal year.")
+
+    # Tools active in the FY
+    pdf.h2("Tools & Subscriptions")
+    trows, tool_total = [], 0.0
+    for t in data.get("tools", []):
+        if scoped and not tool_in_fy(t, eff_fy):
+            continue
+        _m, annual = calc_tool_costs(t)
+        trows.append([t.get("name", ""), t.get("billing_cycle", "Monthly"),
+                      _rpt_money(annual)])
+        tool_total += annual
+    if trows:
+        pdf.table(["Tool", "Billing", "Annual cost"], [100, 40, 50], trows,
+                  aligns=["L", "L", "R"],
+                  totals=["Total", "", _rpt_money(tool_total)])
+    else:
+        pdf.caption("No tools active in this fiscal year.")
+
+    return bytes(pdf.output())
