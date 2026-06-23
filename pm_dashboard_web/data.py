@@ -57,7 +57,7 @@ def blank_project(code, name, has_budget=False):
         "code": code, "has_budget": has_budget,
         "status": "Active",
         "start_date": "", "end_date": "", "extension_date": "",
-        "notes": "", "hours_budget": 0.0, "hours_log": [],
+        "notes": "", "notes_by_fy": {}, "hours_budget": 0.0, "hours_log": [],
         "contracted_hours": 0.0,
         "contracted_hours_by_fy": {},
         "fy_funding": {},
@@ -248,12 +248,26 @@ def _normalize(data: dict) -> dict:
 
     pr = data.get("project_records", {})
     for proj in pr.values():
-        for key, default in [("notes",""), ("start_date",""), ("end_date",""),
+        for key, default in [("notes",""), ("notes_by_fy",{}),
+                              ("start_date",""), ("end_date",""),
                               ("extension_date",""), ("hours_budget",0.0),
                               ("hours_log",[]), ("assigned_tools",[]),
                               ("status","Active"), ("fy_funding",{}),
                               ("lines_by_fy",{}), ("contracted_hours_by_fy",{})]:
             proj.setdefault(key, default)
+        # Per-FY notes: keys are FY years as strings ({"2026": "..."}). The legacy
+        # project-level "notes" string is preserved untouched and acts as the
+        # fallback shown for any FY that has no note of its own (see
+        # project_note_for_fy). Re-key any non-canonical year keys to plain "YYYY".
+        nbf = proj.get("notes_by_fy")
+        if isinstance(nbf, dict) and nbf:
+            fixed_n = {}
+            for k, v in nbf.items():
+                try:
+                    fixed_n[str(int(str(k).split()[1].split("-")[0]))] = v
+                except Exception:
+                    fixed_n[str(k)] = v
+            proj["notes_by_fy"] = fixed_n
         # Migrate old Hours-tab project-level budget into the new contracted_hours field.
         if "contracted_hours" not in proj:
             proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
@@ -440,6 +454,24 @@ def project_primary_fy(proj: dict) -> int:
         if d:
             return date_to_fy(d)
     return date_to_fy(date.today())
+
+
+def project_note_for_fy(proj: dict, year) -> str:
+    """Note text for one fiscal year. A FY that has its own saved note (even an
+    empty string) uses it; otherwise we fall back to the legacy project-level
+    'notes' so existing notes keep showing until a FY-specific note is saved."""
+    nbf = proj.get("notes_by_fy") or {}
+    key = str(year)
+    if key in nbf:
+        return nbf[key] or ""
+    return proj.get("notes", "") or ""
+
+
+def set_project_note_for_fy(proj: dict, year, text: str):
+    """Save a note for one fiscal year. The value is stored even when blank, so
+    clearing a FY's note overrides the legacy fallback rather than re-showing it."""
+    nbf = proj.setdefault("notes_by_fy", {})
+    nbf[str(year)] = text or ""
 
 
 def lines_by_fy(proj: dict) -> dict:
