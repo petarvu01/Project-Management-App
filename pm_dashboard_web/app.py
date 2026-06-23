@@ -19,7 +19,7 @@ from data import (load_data, save_data, blank_project, blank_line,
                   fy_contracted_budget, fy_contracted_hours, fy_hours_summary,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
-                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS, kpi_fy_options)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -33,7 +33,10 @@ def D():
 
 
 def save():
-    save_data(D())
+    ok = save_data(D())
+    if ok is False:
+        st.toast("⚠️ Cloud save failed — saved locally only. "
+                 "Check your connection or Gist token, then re-save.", icon="⚠️")
 
 
 def projects_sorted():
@@ -332,13 +335,46 @@ if page == "Overview":
     selected_kpis = [k for k in D().get("overview_kpis", DEFAULT_KPIS) if k in KPI_LABELS]
     if not selected_kpis:
         selected_kpis = list(DEFAULT_KPIS)
-    kpi_values = compute_kpis(D())
+
+    # Fiscal-year filter (a per-session view setting — not saved/shared).
+    fy_opts = kpi_fy_options(D())
+    fcol, _ = st.columns([1, 3])
+    overview_fy = fcol.selectbox(
+        "Fiscal year", fy_opts, key="overview_fy",
+        help="Scope the KPIs below to one fiscal year. 'All' shows whole-dataset "
+             "totals. Tools have no fiscal year, so the Tools KPIs always show all.",
+    )
+    if overview_fy != "All":
+        st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects and Hours "
+                   "Utilization cover projects running in this fiscal year; Tools "
+                   "cover subscriptions active in it.")
+    kpi_values = compute_kpis(D(), fy=overview_fy)
 
     for start in range(0, len(selected_kpis), 4):
         chunk = selected_kpis[start:start + 4]
         cols = st.columns(4)
         for col, key in zip(cols, chunk):
             col.metric(KPI_LABELS[key], kpi_values.get(key, "—"))
+
+    # ── Printable summary report (PDF, scoped to the selected fiscal year) ─
+    rc1, rc2 = st.columns([1, 2])
+    scope_txt = overview_fy if overview_fy != "All" else "all fiscal years"
+    if rc1.button(f"🖨️ Generate PDF summary"):
+        try:
+            from report import build_fy_report
+            st.session_state["fy_report"] = (overview_fy, build_fy_report(D(), overview_fy))
+        except Exception as e:
+            st.session_state.pop("fy_report", None)
+            st.error(f"Could not generate report: {e}")
+    rep = st.session_state.get("fy_report")
+    if rep and rep[0] == overview_fy:
+        tag = "All" if overview_fy == "All" else overview_fy.split()[-1].strip("()")
+        rc2.download_button("⬇️ Download report PDF", rep[1],
+                            file_name=f"PM_summary_{tag}.pdf",
+                            mime="application/pdf", key="dl_fy_report")
+        rc2.caption(f"Report covers {scope_txt}.")
+    elif rep:
+        rc2.caption("Fiscal year changed — click Generate to refresh the report.")
 
     with st.expander("⚙️ Customize KPIs"):
         st.caption("Pick which metrics show on the Overview. The selection is saved "
@@ -365,10 +401,25 @@ if page == "Overview":
     col_left, col_right = st.columns([2, 3])
 
     with col_left:
-        st.subheader("Hours Utilization")
+        if overview_fy == "All":
+            st.subheader("Hours Utilization")
+            ov_year = None
+        else:
+            st.subheader(f"Hours Utilization — {overview_fy}")
+            try:
+                ov_year = int(overview_fy.split()[1].split("-")[0])
+            except (IndexError, ValueError):
+                ov_year = None
         items = []
         for name, proj in sorted(D()["project_records"].items()):
-            budget, used = project_hours_summary(proj)
+            if ov_year is None:
+                budget, used = project_hours_summary(proj)
+            else:
+                # Only projects actually running in this FY (by their dates),
+                # then this FY's available (carry-in + contracted) vs spent.
+                if not project_in_fy(proj, overview_fy):
+                    continue
+                budget, used, _ = fy_hours_summary(proj, ov_year)
             if budget <= 0:
                 continue
             pct = used / budget * 100
@@ -380,8 +431,10 @@ if page == "Overview":
                 st.markdown(f"**{item['Project']}** {color}")
                 st.progress(min(pct / 100, 1.0))
                 st.caption(f"{item['Used']:.0f} / {item['Budget']:.0f} hrs ({pct:.0f}%)")
-        else:
+        elif overview_fy == "All":
             st.info("No projects with contracted hours set.")
+        else:
+            st.info(f"No projects with contracted hours in {overview_fy}.")
 
     with col_right:
         st.subheader("⚠️ Alerts")
@@ -1205,6 +1258,7 @@ elif page == "Invoices / WO":
                         "sent": sent, "paid": paid,
                     })
                     save()
+                    st.toast("Invoice saved")
                     st.rerun()
         else:
             st.markdown("**Add installments below, then click Save Work Order.**")
@@ -1228,7 +1282,7 @@ elif page == "Invoices / WO":
                         "net_terms": inst_net, "due_date": _date_to_str(inst_due),
                         "sent": False, "paid": False,
                     })
-                    st.success("Installment added. Add another or save the work order.")
+                    st.toast("Installment added — add another or save the work order.")
                     st.rerun()
 
             if save_wo and num_field:
@@ -1243,7 +1297,9 @@ elif page == "Invoices / WO":
                     save()
                     st.session_state.wo_installments = []
                     if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
-                        st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                        st.toast(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                    else:
+                        st.toast("Work order saved")
                     st.rerun()
                 else:
                     st.error("Add at least one installment.")
@@ -1265,9 +1321,11 @@ elif page == "Invoices / WO":
     # ALL RECORDS  (edit inline, then confirm before changes are written)
     # ══════════════════════════════════════════════════════════════════
     st.subheader("All Records")
-    st.caption("Edit any cell directly in the table below — including the **Delete** "
-               "box to remove a row — then click **Review changes**. Nothing is saved "
-               "until you confirm. **Payment Due** and **WO Total** are computed.")
+    st.caption("Edit any cell directly in the table below. To remove a row, tick its "
+               "**🗑️ Delete** box (first column), then click **Review changes** — nothing "
+               "is saved until you confirm. A Work Order shows one row per installment; "
+               "tick every installment row to delete the whole Work Order. "
+               "**Payment Due** and **WO Total** are computed.")
 
     if "inv_editor_gen" not in st.session_state:
         st.session_state.inv_editor_gen = 0
@@ -1279,6 +1337,7 @@ elif page == "Invoices / WO":
         st.info("No records yet. Add an invoice or work order above.")
     else:
         edit_df = pd.DataFrame([{
+            "Delete": False,
             "Type": r["type"],
             "Number": str(r["number"]),
             "Project": r["project"],
@@ -1291,7 +1350,6 @@ elif page == "Invoices / WO":
             "Paid": bool(r["paid"]),
             "Payment Due": fmt_date(r["payment_due"]),
             "WO Total": f"${r['wo_total']:,.2f}" if r["type"] == "Work Order" else "",
-            "Delete": False,
         } for r in flat])
 
         money_col = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
@@ -1299,6 +1357,7 @@ elif page == "Invoices / WO":
             edit_df, use_container_width=True, hide_index=True, num_rows="fixed",
             key=f"inv_editor_{st.session_state.inv_editor_gen}",
             column_config={
+                "Delete": st.column_config.CheckboxColumn("🗑️ Delete", help="Tick to remove this row on save", width="small"),
                 "Type": st.column_config.TextColumn(disabled=True, width="small"),
                 "Number": st.column_config.TextColumn(required=True),
                 "Project": st.column_config.SelectboxColumn(options=projects_sorted(), required=True),
@@ -1311,7 +1370,6 @@ elif page == "Invoices / WO":
                 "Paid": st.column_config.CheckboxColumn(),
                 "Payment Due": st.column_config.TextColumn(disabled=True),
                 "WO Total": st.column_config.TextColumn(disabled=True),
-                "Delete": st.column_config.CheckboxColumn(help="Tick to remove this row on save"),
             },
         )
 

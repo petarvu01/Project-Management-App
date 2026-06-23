@@ -1,0 +1,339 @@
+"""Fiscal-year summary report (PDF) for the PM Dashboard.
+
+build_fy_report(data, fy_label_str) -> bytes
+    Returns a printable PDF summarising the most important results for one
+    fiscal year (or all years when fy_label_str == "All"). The headline KPI
+    block reuses compute_kpis() so the report matches the on-screen Overview
+    exactly; per-project detail uses the same per-FY helpers as the app.
+"""
+from datetime import date
+from fpdf import FPDF
+
+from helpers import fmt_date, parse_date, date_to_fy
+from data import (
+    compute_kpis, KPI_OPTIONS,
+    project_in_fy, fy_budget_available, fy_actual_spend, fy_hours_summary,
+    project_contracted_total, project_hours_summary,
+    flat_invoice_rows, tool_in_fy, calc_tool_costs,
+)
+
+# Usable width on A4 portrait with 10mm margins.
+PAGE_W = 190.0
+INK = (30, 41, 59)        # slate-800
+MUTED = (100, 116, 139)   # slate-500
+ACCENT = (22, 163, 74)    # green-600
+LINE = (203, 213, 225)    # slate-300
+ZEBRA = (241, 245, 249)   # slate-100
+
+
+def _year_of(label):
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def _s(v) -> str:
+    """Make any value safe for the core (latin-1) PDF fonts."""
+    s = str(v)
+    repl = {"\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+            "\u201c": '"', "\u201d": '"', "\u2022": "*", "\u2260": "!=",
+            "\u2192": "->", "\u2026": "...", "\u00a0": " "}
+    for k, val in repl.items():
+        s = s.replace(k, val)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def _money(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _hrs(x) -> str:
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return "0"
+
+
+def _pct(used, avail) -> str:
+    try:
+        return f"{(used / avail * 100):.0f}%" if avail else "-"
+    except Exception:
+        return "-"
+
+
+class _Report(FPDF):
+    def __init__(self, scope_label):
+        super().__init__(orientation="P", unit="mm", format="A4")
+        self.scope_label = scope_label
+        self.set_auto_page_break(auto=True, margin=14)
+        self.set_margins(10, 12, 10)
+
+    def footer(self):
+        self.set_y(-12)
+        self.set_font("helvetica", "", 8)
+        self.set_text_color(*MUTED)
+        self.cell(0, 6, _s(f"PM Dashboard  -  {self.scope_label}"), align="L")
+        self.cell(0, 6, _s(f"Page {self.page_no()}/{{nb}}"), align="R")
+
+    # ── building blocks ──────────────────────────────────────────────────
+    def h1(self, text):
+        self.set_font("helvetica", "B", 18)
+        self.set_text_color(*INK)
+        self.cell(0, 10, _s(text), new_x="LMARGIN", new_y="NEXT")
+
+    def h2(self, text):
+        self.ln(3)
+        self.set_font("helvetica", "B", 12)
+        self.set_text_color(*ACCENT)
+        self.cell(0, 7, _s(text), new_x="LMARGIN", new_y="NEXT")
+        self.set_draw_color(*LINE)
+        self.set_line_width(0.3)
+        y = self.get_y()
+        self.line(10, y, 10 + PAGE_W, y)
+        self.ln(1.5)
+
+    def caption(self, text):
+        self.set_font("helvetica", "", 9)
+        self.set_text_color(*MUTED)
+        self.multi_cell(0, 5, _s(text))
+        self.ln(0.5)
+
+    def kpi_grid(self, pairs, cols=3):
+        """pairs: list of (label, value). Renders cards in a grid."""
+        gap = 3
+        cw = (PAGE_W - gap * (cols - 1)) / cols
+        ch = 15
+        for i, (label, value) in enumerate(pairs):
+            col = i % cols
+            if col == 0:
+                self._row_y = self.get_y()
+                if self._row_y + ch > self.page_break_trigger:
+                    self.add_page()
+                    self._row_y = self.get_y()
+            x = 10 + col * (cw + gap)
+            self.set_xy(x, self._row_y)
+            self.set_draw_color(*LINE)
+            self.set_fill_color(*ZEBRA)
+            self.set_line_width(0.2)
+            self.rect(x, self._row_y, cw, ch, style="DF")
+            self.set_xy(x + 2.5, self._row_y + 2.5)
+            self.set_font("helvetica", "", 8)
+            self.set_text_color(*MUTED)
+            self.cell(cw - 5, 4, _s(label.upper()))
+            self.set_xy(x + 2.5, self._row_y + 7)
+            self.set_font("helvetica", "B", 13)
+            self.set_text_color(*INK)
+            self.cell(cw - 5, 6, _s(value))
+            if col == cols - 1:
+                self.set_y(self._row_y + ch + gap)
+        if len(pairs) % cols != 0:
+            self.set_y(self._row_y + ch + gap)
+
+    def table(self, headers, widths, rows, aligns=None, totals=None):
+        aligns = aligns or ["L"] * len(headers)
+        self.set_font("helvetica", "B", 9)
+        self.set_fill_color(*INK)
+        self.set_text_color(255, 255, 255)
+        self.set_draw_color(*LINE)
+        for h, w, a in zip(headers, widths, aligns):
+            self.cell(w, 7, _s(h), border=0, align=a, fill=True)
+        self.ln()
+        self.set_font("helvetica", "", 9)
+        self.set_text_color(*INK)
+        fill = False
+        for row in rows:
+            if self.get_y() + 6 > self.page_break_trigger:
+                self.add_page()
+                # repeat header
+                self.set_font("helvetica", "B", 9)
+                self.set_fill_color(*INK)
+                self.set_text_color(255, 255, 255)
+                for h, w, a in zip(headers, widths, aligns):
+                    self.cell(w, 7, _s(h), border=0, align=a, fill=True)
+                self.ln()
+                self.set_font("helvetica", "", 9)
+                self.set_text_color(*INK)
+            self.set_fill_color(*ZEBRA)
+            for cell, w, a in zip(row, widths, aligns):
+                self.cell(w, 6, _s(cell), border=0, align=a, fill=fill)
+            self.ln()
+            fill = not fill
+        if totals:
+            self.set_font("helvetica", "B", 9)
+            self.set_fill_color(*ZEBRA)
+            for cell, w, a in zip(totals, widths, aligns):
+                self.cell(w, 6.5, _s(cell), border="T", align=a, fill=True)
+            self.ln()
+        self.ln(2)
+
+
+def _whole_project_actual(proj) -> float:
+    total = 0.0
+    for r in proj.get("lines", []):
+        try:
+            total += int(r[1]) * float(r[2]) * float(r[3])
+            total += float(r[4]) * float(r[5])
+            total += float(r[8])
+        except (TypeError, ValueError, IndexError):
+            pass
+    return total
+
+
+def build_fy_report(data: dict, fy: str = "All") -> bytes:
+    y = _year_of(fy) if fy != "All" else None
+    scoped = y is not None          # unparseable label -> whole-dataset, like compute_kpis
+    eff_fy = fy if scoped else "All"
+    scope_label = fy if scoped else "All fiscal years"
+
+    pdf = _Report(scope_label)
+    pdf.alias_nb_pages()
+    pdf.add_page()
+
+    # ── Title ────────────────────────────────────────────────────────────
+    pdf.h1("Project Management Summary")
+    pdf.set_font("helvetica", "", 11)
+    pdf.set_text_color(*MUTED)
+    pdf.cell(0, 6, _s(f"Fiscal year: {scope_label}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _s(f"Generated: {date.today().strftime('%b %d, %Y')}"),
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    # ── Headline KPIs (same numbers as the Overview) ─────────────────────
+    kpis = compute_kpis(data, fy=eff_fy)
+    headline_keys = ["active_projects", "total_credits", "total_budget",
+                     "total_actuals", "total_cont_hours", "total_hours_deducted",
+                     "hours_remaining", "unpaid_amount", "tools_annual"]
+    label_map = dict(KPI_OPTIONS)
+    pdf.h2("Key metrics")
+    pdf.kpi_grid([(label_map.get(k, k), kpis.get(k, "-")) for k in headline_keys], cols=3)
+
+    pr = data.get("project_records", {})
+
+    # ── Projects: budget ────────────────────────────────────────────────
+    pdf.h2("Projects - Budget")
+    rows, t_avail, t_spent = [], 0.0, 0.0
+    for name in sorted(pr):
+        proj = pr[name]
+        if scoped:
+            if not project_in_fy(proj, eff_fy):
+                continue
+            avail = fy_budget_available(proj, y)
+            spent = fy_actual_spend(proj, y)
+        else:
+            avail = project_contracted_total(proj)
+            spent = _whole_project_actual(proj)
+        if avail == 0 and spent == 0:
+            continue
+        status = proj.get("status", "Active")
+        rows.append([name, status, _money(avail), _money(spent),
+                     _money(avail - spent), _pct(spent, avail)])
+        t_avail += avail
+        t_spent += spent
+    if rows:
+        pdf.table(
+            ["Project", "Status", "Budget", "Spent", "Remaining", "% Used"],
+            [60, 25, 28, 28, 28, 21], rows,
+            aligns=["L", "L", "R", "R", "R", "R"],
+            totals=["Total", "", _money(t_avail), _money(t_spent),
+                    _money(t_avail - t_spent), _pct(t_spent, t_avail)],
+        )
+    else:
+        pdf.caption("No project budget activity for this fiscal year.")
+
+    # ── Projects: hours ─────────────────────────────────────────────────
+    pdf.h2("Projects - Hours")
+    hrows, h_avail, h_used = [], 0.0, 0.0
+    for name in sorted(pr):
+        proj = pr[name]
+        if scoped:
+            if not project_in_fy(proj, eff_fy):
+                continue
+            avail, used, _rem = fy_hours_summary(proj, y)
+        else:
+            avail, used = project_hours_summary(proj)
+        if avail <= 0:
+            continue
+        hrows.append([name, _hrs(avail), _hrs(used), _hrs(avail - used),
+                      _pct(used, avail)])
+        h_avail += avail
+        h_used += used
+    if hrows:
+        pdf.table(
+            ["Project", "Available", "Used", "Remaining", "% Used"],
+            [70, 30, 30, 30, 30], hrows,
+            aligns=["L", "R", "R", "R", "R"],
+            totals=["Total", _hrs(h_avail), _hrs(h_used),
+                    _hrs(h_avail - h_used), _pct(h_used, h_avail)],
+        )
+    else:
+        pdf.caption("No projects with contracted hours for this fiscal year.")
+
+    # ── Invoices / Work Orders ──────────────────────────────────────────
+    pdf.h2("Invoices & Work Orders")
+    inv_rows = []
+    for r in flat_invoice_rows(data):
+        if scoped:
+            pd_date = parse_date(r["due_date"])
+            if not (pd_date and date_to_fy(pd_date) == y):
+                continue
+        inv_rows.append(r)
+    total_billed = sum(r["inst_amount"] for r in inv_rows)
+    unpaid = [r for r in inv_rows if not r["paid"]]
+    unpaid_amt = sum(r["inst_amount"] for r in unpaid)
+    today = date.today()
+
+    def _due(r):
+        return parse_date(r["payment_due"]) or parse_date(r["due_date"])
+
+    overdue = [r for r in unpaid if _due(r) and _due(r) < today]
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_text_color(*INK)
+    pdf.multi_cell(0, 5.5, _s(
+        f"Records: {len(inv_rows)}    Billed: {_money(total_billed)}    "
+        f"Unpaid: {len(unpaid)} ({_money(unpaid_amt)})    Overdue: {len(overdue)}"))
+    pdf.ln(1)
+    show = sorted(unpaid, key=lambda r: (_due(r) or date.max))
+    if show:
+        pdf.caption("Outstanding items (unpaid), earliest due first:")
+        irows = []
+        for r in show[:25]:
+            due = _due(r)
+            od = "OVERDUE" if (due and due < today) else "due"
+            irows.append([r["type"], r["number"], r["project"],
+                          _money(r["inst_amount"]), fmt_date(r["due_date"]), od])
+        pdf.table(
+            ["Type", "Number", "Project", "Amount", "Due", "Status"],
+            [24, 28, 50, 28, 30, 30], irows,
+            aligns=["L", "L", "L", "R", "L", "L"],
+        )
+        if len(show) > 25:
+            pdf.caption(f"... and {len(show) - 25} more outstanding item(s).")
+    else:
+        pdf.caption("No outstanding invoices or work orders for this fiscal year.")
+
+    # ── Tools active in the FY ──────────────────────────────────────────
+    pdf.h2("Tools & Subscriptions")
+    trows, tool_total = [], 0.0
+    for t in data.get("tools", []):
+        if scoped and not tool_in_fy(t, eff_fy):
+            continue
+        _m, annual = calc_tool_costs(t)
+        cycle = t.get("billing_cycle", "Monthly")
+        trows.append([t.get("name", ""), cycle, _money(annual)])
+        tool_total += annual
+    if trows:
+        pdf.table(
+            ["Tool", "Billing", "Annual cost"],
+            [100, 40, 50], trows,
+            aligns=["L", "L", "R"],
+            totals=["Total", "", _money(tool_total)],
+        )
+    else:
+        pdf.caption("No tools active in this fiscal year.")
+
+    out = pdf.output()
+    return bytes(out)
