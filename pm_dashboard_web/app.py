@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
+import base64
+from pathlib import Path
 from datetime import date
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
@@ -295,20 +297,69 @@ if "page" not in st.session_state:
 
 
 # ─── Login gate (centered, shown before the app shell) ───────────────────
+def _login_bg_b64():
+    """Read the login background image next to this script and return it
+    base64-encoded, or None if it isn't found."""
+    for name in ("CIRATLogo.jpg", "login-bg.jpg", "login_bg.jpg"):
+        p = Path(__file__).parent / name
+        if p.exists():
+            try:
+                return base64.b64encode(p.read_bytes()).decode("ascii")
+            except Exception:
+                return None
+    return None
+
+
+def _inject_login_style():
+    """Full-screen background image for the login page + a translucent,
+    still-legible (frosted-glass) login card. Login screen only."""
+    b64 = _login_bg_b64()
+    bg_layer = (
+        f'linear-gradient(rgba(2,6,23,0.55), rgba(2,6,23,0.65)), '
+        f'url("data:image/jpeg;base64,{b64}")' if b64
+        else 'linear-gradient(135deg, #0f172a, #1e293b)'
+    )
+    st.markdown(f"""
+    <style>
+      [data-testid="stAppViewContainer"] {{
+          background-image: {bg_layer};
+          background-size: cover;
+          background-position: center;
+          background-repeat: no-repeat;
+      }}
+      [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
+      /* The login form becomes a translucent frosted card */
+      [data-testid="stForm"] {{
+          background: rgba(15, 23, 42, 0.45);
+          backdrop-filter: blur(10px);
+          -webkit-backdrop-filter: blur(10px);
+          border: 1px solid rgba(255,255,255,0.18);
+          border-radius: 16px;
+          padding: 22px 22px 8px;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+      }}
+      [data-testid="stForm"] label,
+      [data-testid="stForm"] p {{ color: #e2e8f0 !important; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
 def _login_gate():
     """Block the whole app behind a centered sign-in screen until a valid
     account + password is entered. Returns once signed in."""
     if st.session_state.get("role"):
         return
+    _inject_login_style()
     # Center a compact login card; nothing else renders until signed in.
     st.markdown("<div style='height: 8vh;'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown(
-            "<div style='text-align:center;'>"
+            "<div style='text-align:center; text-shadow: 0 2px 8px rgba(0,0,0,0.6);'>"
             "<div style='font-size:34px;'>📁</div>"
-            "<div style='font-size:22px; font-weight:600; margin-top:4px;'>PM Dashboard</div>"
-            "<div style='font-size:13px; color:#64748b; margin:4px 0 18px;'>"
+            "<div style='font-size:22px; font-weight:600; margin-top:4px; "
+            "color:#f8fafc;'>PM Dashboard</div>"
+            "<div style='font-size:13px; color:#cbd5e1; margin:4px 0 18px;'>"
             "Sign in to continue</div></div>",
             unsafe_allow_html=True)
         with st.form("login_form"):
