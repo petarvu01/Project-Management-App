@@ -329,7 +329,7 @@ def _inject_login_style():
           background-color: #0f172a;
           {f'background-image: url("data:{mime};base64,{b64}");' if b64 else
             'background-image: linear-gradient(135deg, #0f172a, #1e293b);'}
-          background-size: cover;            /* fills the screen */
+          background-size: auto 100%;        /* full height shown; width scales */
           background-position: center;
           background-repeat: no-repeat;
           background-attachment: fixed;
