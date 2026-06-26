@@ -297,17 +297,21 @@ if "page" not in st.session_state:
 
 
 # ─── Login gate (centered, shown before the app shell) ───────────────────
-def _login_bg_b64():
-    """Read the login background image next to this script and return it
-    base64-encoded, or None if it isn't found."""
-    for name in ("CIRATLogo.jpg", "login-bg.jpg", "login_bg.jpg"):
+def _login_bg():
+    """Find the login background image next to this script (PNG or JPG) and
+    return (base64_data, mime_type), or (None, None) if none is found."""
+    names = ("CIRATLogo.png", "CIRATLogo.jpg", "CIRATLogo.jpeg",
+             "login-bg.png", "login-bg.jpg", "login_bg.png", "login_bg.jpg")
+    for name in names:
         p = Path(__file__).parent / name
         if p.exists():
             try:
-                return base64.b64encode(p.read_bytes()).decode("ascii")
+                data = base64.b64encode(p.read_bytes()).decode("ascii")
+                mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+                return data, mime
             except Exception:
-                return None
-    return None
+                return None, None
+    return None, None
 
 
 def _inject_login_style():
@@ -316,14 +320,14 @@ def _inject_login_style():
 
     Uses background-size: contain so the WHOLE image shows the same way on
     any monitor resolution (no resolution-dependent cropping). To change the
-    picture, replace the image file in this folder (keep the same name), or
-    add one named login-bg.jpg / login_bg.jpg."""
-    b64 = _login_bg_b64()
+    picture, replace the image file in this folder. PNG or JPG both work; the
+    name can be CIRATLogo / login-bg / login_bg with a .png or .jpg ending."""
+    b64, mime = _login_bg()
     st.markdown(f"""
     <style>
       [data-testid="stAppViewContainer"] {{
           background-color: #0f172a;
-          {f'background-image: url("data:image/jpeg;base64,{b64}");' if b64 else
+          {f'background-image: url("data:{mime};base64,{b64}");' if b64 else
             'background-image: linear-gradient(135deg, #0f172a, #1e293b);'}
           background-size: contain;          /* whole image, same on every screen */
           background-position: center;
