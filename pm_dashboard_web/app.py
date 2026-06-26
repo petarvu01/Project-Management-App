@@ -293,6 +293,42 @@ NAV_ITEMS = [
 if "page" not in st.session_state:
     st.session_state.page = "Overview"
 
+
+# ─── Login gate (centered, shown before the app shell) ───────────────────
+def _login_gate():
+    """Block the whole app behind a centered sign-in screen until a valid
+    account + password is entered. Returns once signed in."""
+    if st.session_state.get("role"):
+        return
+    # Center a compact login card; nothing else renders until signed in.
+    st.markdown("<div style='height: 8vh;'></div>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown(
+            "<div style='text-align:center;'>"
+            "<div style='font-size:34px;'>📁</div>"
+            "<div style='font-size:22px; font-weight:600; margin-top:4px;'>PM Dashboard</div>"
+            "<div style='font-size:13px; color:#64748b; margin:4px 0 18px;'>"
+            "Sign in to continue</div></div>",
+            unsafe_allow_html=True)
+        with st.form("login_form"):
+            acct = st.selectbox("Account", list(ACCOUNTS.keys()), key="login_account")
+            pw = st.text_input("Password", type="password", key="login_pw")
+            ok = st.form_submit_button("Sign in", use_container_width=True,
+                                       type="primary")
+        if ok:
+            want = ACCOUNTS[acct]
+            if pw == _PASSWORDS[want]:
+                st.session_state["role"] = want
+                st.session_state.pop("login_pw", None)
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+
+_login_gate()
+
 with st.sidebar:
     # Logo
     st.markdown("""
@@ -331,37 +367,22 @@ with st.sidebar:
     st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; '
                 'margin: 16px 0 12px;">', unsafe_allow_html=True)
 
-    # ── Account picker ──────────────────────────────────────────────────
+    # ── Signed-in account + sign out (login happens on the centered gate) ──
     role = st.session_state.get("role")
-    if role:
-        badge = "🔑 Privileged" if role == "editor" else "👁️ View only"
-        st.markdown(f"""
-        <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
-            <div style="width: 28px; height: 28px; border-radius: 50%;
-                        background: rgba(52,211,153,0.15); display: flex;
-                        align-items: center; justify-content: center;
-                        font-size: 11px; font-weight: 500; color: #34d399 !important;">PM</div>
-            <span style="font-size: 12px; color: #475569 !important;">{badge}</span>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("Sign out", use_container_width=True, key="sign_out"):
-            st.session_state.pop("role", None)
-            st.rerun()
-    else:
-        st.markdown('<div style="font-size: 12px; color: #475569 !important; '
-                    'padding: 4px 4px 6px;">Sign in to continue</div>',
-                    unsafe_allow_html=True)
-        acct = st.selectbox("Account", list(ACCOUNTS.keys()), key="login_account")
-        pw = st.text_input("Password", type="password", key="login_pw")
-        if st.button("Sign in", use_container_width=True, type="primary",
-                     key="sign_in"):
-            want = ACCOUNTS[acct]
-            if pw == _PASSWORDS[want]:
-                st.session_state["role"] = want
-                st.session_state.pop("login_pw", None)
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
+    badge = "🔑 Privileged" if role == "editor" else "👁️ View only"
+    st.markdown(f"""
+    <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
+        <div style="width: 28px; height: 28px; border-radius: 50%;
+                    background: rgba(52,211,153,0.15); display: flex;
+                    align-items: center; justify-content: center;
+                    font-size: 11px; font-weight: 500; color: #34d399 !important;">PM</div>
+        <span style="font-size: 12px; color: #475569 !important;">{badge}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button("Sign out", use_container_width=True, key="sign_out"):
+        st.session_state.pop("role", None)
+        st.session_state.pop("login_pw", None)
+        st.rerun()
 
     # Storage status + manual backup
     if gist_configured():
@@ -376,13 +397,6 @@ with st.sidebar:
     )
 
 page = st.session_state.page
-
-# Require a signed-in account before showing any data.
-if not st.session_state.get("role"):
-    st.title("📁 PM Dashboard")
-    st.info("Please sign in from the sidebar to continue. "
-            "Choose an account and enter its password.")
-    st.stop()
 
 
 # ═════════════════════════════════════════════════════════════════════════
