@@ -329,7 +329,7 @@ def _inject_login_style():
           background-color: #0f172a;
           {f'background-image: url("data:{mime};base64,{b64}");' if b64 else
             'background-image: linear-gradient(135deg, #0f172a, #1e293b);'}
-          background-size: contain;          /* whole image, same on every screen */
+          background-size: cover;            /* fills the screen */
           background-position: center;
           background-repeat: no-repeat;
           background-attachment: fixed;
@@ -361,14 +361,6 @@ def _login_gate():
     st.markdown("<div style='height: 8vh;'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
-        st.markdown(
-            "<div style='text-align:center; text-shadow: 0 2px 8px rgba(0,0,0,0.6);'>"
-            "<div style='font-size:34px;'>📁</div>"
-            "<div style='font-size:22px; font-weight:600; margin-top:4px; "
-            "color:#f8fafc;'>PM Dashboard</div>"
-            "<div style='font-size:13px; color:#cbd5e1; margin:4px 0 18px;'>"
-            "Sign in to continue</div></div>",
-            unsafe_allow_html=True)
         with st.form("login_form"):
             acct = st.selectbox("Account", list(ACCOUNTS.keys()), key="login_account")
             pw = st.text_input("Password", type="password", key="login_pw")
