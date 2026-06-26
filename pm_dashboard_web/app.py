@@ -312,20 +312,23 @@ def _login_bg_b64():
 
 def _inject_login_style():
     """Full-screen background image for the login page + a translucent,
-    still-legible (frosted-glass) login card. Login screen only."""
+    still-legible (frosted-glass) login card. Login screen only.
+
+    Uses background-size: contain so the WHOLE image shows the same way on
+    any monitor resolution (no resolution-dependent cropping). To change the
+    picture, replace the image file in this folder (keep the same name), or
+    add one named login-bg.jpg / login_bg.jpg."""
     b64 = _login_bg_b64()
-    bg_layer = (
-        f'linear-gradient(rgba(2,6,23,0.55), rgba(2,6,23,0.65)), '
-        f'url("data:image/jpeg;base64,{b64}")' if b64
-        else 'linear-gradient(135deg, #0f172a, #1e293b)'
-    )
     st.markdown(f"""
     <style>
       [data-testid="stAppViewContainer"] {{
-          background-image: {bg_layer};
-          background-size: cover;
+          background-color: #0f172a;
+          {f'background-image: url("data:image/jpeg;base64,{b64}");' if b64 else
+            'background-image: linear-gradient(135deg, #0f172a, #1e293b);'}
+          background-size: contain;          /* whole image, same on every screen */
           background-position: center;
           background-repeat: no-repeat;
+          background-attachment: fixed;
       }}
       [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
       /* The login form becomes a translucent frosted card */
