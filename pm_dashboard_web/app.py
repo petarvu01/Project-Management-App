@@ -1866,6 +1866,8 @@ elif page == "Tools":
             fy_total = tool_fy_total(t, tool_fy)
             fy_cell = f"${fy_total:,.2f}" if n_users else "—"
             tool_data.append({
+                "🔍": False,
+                "⚙️": False,
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
                 "Cost": f"${t.get('cost', 0):,.2f}",
@@ -1881,83 +1883,105 @@ elif page == "Tools":
                 "Paid": "☑" if t.get("paid") else "☐",
                 "Notes": t.get("notes", ""),
             })
-        event = st.dataframe(
-            pd.DataFrame(tool_data), use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="tools_table",
+        VIEW_COL, ACT_COL = "🔍", "⚙️"
+        df_tools = pd.DataFrame(tool_data)
+        gen = st.session_state.get("tools_table_gen", 0)
+        # 🔍 is always editable (viewers can inspect); ⚙️ only for editors.
+        disabled_cols = [c for c in df_tools.columns
+                         if not (c == VIEW_COL or (c == ACT_COL and can_edit()))]
+        edited = st.data_editor(
+            df_tools, use_container_width=True, hide_index=True, num_rows="fixed",
+            key=f"tools_table_{tool_fy}_{gen}", disabled=disabled_cols,
             column_config={
+                VIEW_COL: st.column_config.CheckboxColumn(
+                    VIEW_COL, width="small",
+                    help="Tick to show this tool's per-project breakdown for the "
+                         "selected fiscal year."),
+                ACT_COL: st.column_config.CheckboxColumn(
+                    ACT_COL, width="small",
+                    help="Tick to manage this tool — toggle Paid, delete, or set "
+                         "its cost split."),
                 "Notes": st.column_config.TextColumn(
                     "Notes", width="large",
                     help="Drag the column border to widen, or scroll the table "
-                         "sideways to read the full note.",
-                ),
+                         "sideways to read the full note."),
             },
         )
+        st.caption("Tick **🔍** to view a tool's per-project breakdown, or **⚙️** "
+                   "to manage it (Paid / delete / cost split). They're independent.")
 
-        # Toggle paid / Delete on the selected row (map back to the real index)
-        sel = event.selection.rows
-        if sel and sel[0] < len(filtered):
-            i = filtered[sel[0]][0]
-            st.caption(f"Selected: **{tools[i].get('name', '')}**")
+        def _first_checked(col):
+            try:
+                vals = edited[col].tolist()
+            except Exception:
+                return None
+            for pos, v in enumerate(vals):
+                if bool(v) and pos < len(filtered):
+                    return pos
+            return None
 
-            # ── Per-project breakdown for the selected tool & FY ──────────
-            sel_tool = tools[i]
-            sel_users = tool_users(D(), sel_tool.get("name", ""))
-            sel_cycle = sel_tool.get("billing_cycle", "Monthly")
-            if sel_users:
+        view_pos = _first_checked(VIEW_COL)
+        act_pos = _first_checked(ACT_COL)
+
+        # ── 🔍 Per-project breakdown (read-only; available to viewers too) ──
+        if view_pos is not None:
+            vt = filtered[view_pos][1]
+            v_users = tool_users(D(), vt.get("name", ""))
+            v_cycle = vt.get("billing_cycle", "Monthly")
+            st.markdown(f"**{vt.get('name','')} — {tool_fy} breakdown**")
+            if v_users:
                 breakdown = []
-                for p in sel_users:
-                    split = tool_split_for(D(), sel_tool, p)
-                    amt = tool_fy_amount_for_project(sel_tool, p, tool_fy)
-                    if sel_cycle == "Monthly":
-                        months = tool_fy_months(sel_tool, tool_fy)
+                for p in v_users:
+                    split = tool_split_for(D(), vt, p)
+                    amt = tool_fy_amount_for_project(vt, p, tool_fy)
+                    if v_cycle == "Monthly":
                         breakdown.append({
-                            "Project": p,
-                            "Cycle": "Monthly",
+                            "Project": p, "Cycle": "Monthly",
                             "Split / mo": f"${split:,.2f}",
-                            "Months in FY": months,
+                            "Months in FY": tool_fy_months(vt, tool_fy),
                             f"{tool_fy} amount": f"${amt:,.2f}",
                         })
                     else:
                         breakdown.append({
-                            "Project": p,
-                            "Cycle": "One-time",
-                            "Split / mo": "—",
-                            "Months in FY": "—",
+                            "Project": p, "Cycle": "One-time",
+                            "Split / mo": "—", "Months in FY": "—",
                             f"{tool_fy} amount": f"${amt:,.2f}"
-                            if tool_onetime_in_fy(sel_tool, tool_fy) else "— (other FY)",
+                            if tool_onetime_in_fy(vt, tool_fy) else "— (other FY)",
                         })
-                st.markdown(f"**{sel_tool.get('name','')} — {tool_fy} breakdown**")
                 st.dataframe(pd.DataFrame(breakdown), use_container_width=True,
                              hide_index=True)
                 st.caption(f"FY total across projects: "
-                           f"**${tool_fy_total(sel_tool, tool_fy):,.2f}**. "
-                           "Monthly tools = split × active months this FY; "
-                           "one-time tools count only in their start-date FY.")
+                           f"**${tool_fy_total(vt, tool_fy):,.2f}**. "
+                           "Monthly = split × active months this FY; "
+                           "one-time counts only in its start-date FY.")
             else:
                 st.caption("Not assigned to any project yet.")
 
+        # ── ⚙️ Manage the selected tool (editors only) ──────────────────────
+        if can_edit() and act_pos is not None:
+            i = filtered[act_pos][0]
+            st.caption(f"Managing: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
-            if can_edit() and b1.button("Toggle Paid ☐ ↔ ☑"):
+            if b1.button("Toggle Paid ☐ ↔ ☑"):
                 tools[i]["paid"] = not tools[i].get("paid", False)
                 save()
                 st.rerun()
-            if can_edit() and b2.button("🗑️ Delete Tool"):
+            if b2.button("🗑️ Delete Tool"):
                 st.session_state["confirm_del_tool"] = i
-            # Reset a pending confirmation if a different row got selected.
             if (st.session_state.get("confirm_del_tool") is not None
                     and st.session_state["confirm_del_tool"] != i):
                 st.session_state.pop("confirm_del_tool", None)
-            # Two-step confirmation so a tool is never removed by a stray click.
             if st.session_state.get("confirm_del_tool") == i:
                 st.warning(f"Remove **{tools[i].get('name', '')}**? "
                            "This can't be undone.")
                 cd1, cd2 = st.columns(2)
-                if can_edit() and cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
+                if cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
                     tools.pop(i)
                     st.session_state.pop("confirm_del_tool", None)
+                    st.session_state["tools_table_gen"] = gen + 1  # reset checks
                     save()
                     st.rerun()
-                if can_edit() and cd2.button("↩️ Cancel", key=f"del_no_{i}"):
+                if cd2.button("↩️ Cancel", key=f"del_no_{i}"):
                     st.session_state.pop("confirm_del_tool", None)
                     st.rerun()
 
@@ -1998,16 +2022,15 @@ elif page == "Tools":
                 else:
                     st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
                 sc1, sc2 = st.columns(2)
-                if can_edit() and sc1.button("💾 Save Split", key=f"save_split_{i}"):
+                if sc1.button("💾 Save Split", key=f"save_split_{i}"):
                     t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
                     save()
                     st.toast("Custom $ split saved")
                     st.rerun()
-                if can_edit() and sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
+                if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
                     t_sel["split_amounts"] = {}
                     save()
                     st.rerun()
-                # Preview of resulting annual shares (exactly as entered, annualized)
                 from data import _cycle_amount_to_monthly_annual
                 preview = []
                 for p, v in amt_inputs.items():
@@ -2021,8 +2044,6 @@ elif page == "Tools":
             elif len(users) == 1:
                 st.caption(f"Only **{users[0]}** uses this tool — it bears the full cost. "
                            "Assign the tool to more projects to split it.")
-        else:
-            st.caption("Click a row above to toggle Paid, delete, or set a cost split.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
