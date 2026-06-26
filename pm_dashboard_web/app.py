@@ -6,7 +6,7 @@ import json
 import base64
 from pathlib import Path
 from datetime import date
-from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
+from helpers import (parse_date, fmt_date, fy_label, date_to_fy, fy_range,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
@@ -73,6 +73,49 @@ def save():
 
 def projects_sorted():
     return sorted(D()["project_records"].keys())
+
+
+def tool_fy_months(tool: dict, fy_lbl: str) -> int:
+    """Number of full monthly cycles a Monthly tool is active within a fiscal
+    year. Counts by calendar month (the start month counts as a full month),
+    bounded by the FY window and the tool's own start/end dates."""
+    fy_s, fy_e = fy_range(fy_lbl)
+    if not fy_s:                       # "All" or unparseable → treat as full year
+        return 12
+    t_start = parse_date(tool.get("start_date", ""))
+    t_end = parse_date(tool.get("end_date", ""))
+    start = max(t_start, fy_s) if t_start else fy_s
+    end = min(t_end, fy_e) if t_end else fy_e
+    if end < start:
+        return 0
+    return (end.year - start.year) * 12 + (end.month - start.month) + 1
+
+
+def tool_onetime_in_fy(tool: dict, fy_lbl: str) -> bool:
+    """A One-time tool's cost belongs to the single FY of its start date."""
+    fy_s, _ = fy_range(fy_lbl)
+    if not fy_s:
+        return True
+    t_start = parse_date(tool.get("start_date", ""))
+    if not t_start:
+        return True
+    return date_to_fy(t_start) == date_to_fy(fy_s)
+
+
+def tool_fy_amount_for_project(tool: dict, project: str, fy_lbl: str) -> float:
+    """A project's prorated cost for this tool in the selected FY.
+    Monthly → monthly split × active months in the FY.
+    One-time → the one-time split, but only in its start-date FY (else 0)."""
+    split = tool_split_for(D(), tool, project)   # billing-cycle units
+    if tool.get("billing_cycle") == "Monthly":
+        return split * tool_fy_months(tool, fy_lbl)
+    return split if tool_onetime_in_fy(tool, fy_lbl) else 0.0
+
+
+def tool_fy_total(tool: dict, fy_lbl: str) -> float:
+    """The tool's total prorated cost across all assigned projects for the FY."""
+    return sum(tool_fy_amount_for_project(tool, p, fy_lbl)
+               for p in tool_users(D(), tool.get("name", "")))
 
 
 def line_value(row, idx, default=0.0):
@@ -1820,12 +1863,8 @@ elif page == "Tools":
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
             n_users = count_tool_users(D(), t.get("name", ""))
-            if n_users <= 0:
-                per_proj = "—"
-            elif tool_has_custom_split(D(), t):
-                per_proj = "custom"
-            else:
-                per_proj = f"${ac / n_users:,.2f}"
+            fy_total = tool_fy_total(t, tool_fy)
+            fy_cell = f"${fy_total:,.2f}" if n_users else "—"
             tool_data.append({
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
@@ -1834,7 +1873,7 @@ elif page == "Tools":
                 "Monthly": f"${mc:,.2f}" if t.get("billing_cycle") == "Monthly" else "—",
                 "Annual": f"${ac:,.2f}",
                 "Used by": f"{n_users}" if n_users else "—",
-                "Per project / yr": per_proj,
+                f"{tool_fy} total": fy_cell,
                 "Start": fmt_date(t.get("start_date", "")),
                 "End": fmt_date(t.get("end_date", "")) if t.get("end_date") else "ongoing",
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
@@ -1859,6 +1898,44 @@ elif page == "Tools":
         if sel and sel[0] < len(filtered):
             i = filtered[sel[0]][0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
+
+            # ── Per-project breakdown for the selected tool & FY ──────────
+            sel_tool = tools[i]
+            sel_users = tool_users(D(), sel_tool.get("name", ""))
+            sel_cycle = sel_tool.get("billing_cycle", "Monthly")
+            if sel_users:
+                breakdown = []
+                for p in sel_users:
+                    split = tool_split_for(D(), sel_tool, p)
+                    amt = tool_fy_amount_for_project(sel_tool, p, tool_fy)
+                    if sel_cycle == "Monthly":
+                        months = tool_fy_months(sel_tool, tool_fy)
+                        breakdown.append({
+                            "Project": p,
+                            "Cycle": "Monthly",
+                            "Split / mo": f"${split:,.2f}",
+                            "Months in FY": months,
+                            f"{tool_fy} amount": f"${amt:,.2f}",
+                        })
+                    else:
+                        breakdown.append({
+                            "Project": p,
+                            "Cycle": "One-time",
+                            "Split / mo": "—",
+                            "Months in FY": "—",
+                            f"{tool_fy} amount": f"${amt:,.2f}"
+                            if tool_onetime_in_fy(sel_tool, tool_fy) else "— (other FY)",
+                        })
+                st.markdown(f"**{sel_tool.get('name','')} — {tool_fy} breakdown**")
+                st.dataframe(pd.DataFrame(breakdown), use_container_width=True,
+                             hide_index=True)
+                st.caption(f"FY total across projects: "
+                           f"**${tool_fy_total(sel_tool, tool_fy):,.2f}**. "
+                           "Monthly tools = split × active months this FY; "
+                           "one-time tools count only in their start-date FY.")
+            else:
+                st.caption("Not assigned to any project yet.")
+
             b1, b2 = st.columns(2)
             if can_edit() and b1.button("Toggle Paid ☐ ↔ ☑"):
                 tools[i]["paid"] = not tools[i].get("paid", False)
