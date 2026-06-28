@@ -141,7 +141,9 @@ def _roster_cols(df):
                    lambda s: s == "id")
     first = pick(lambda s: "first" in s)
     last = pick(lambda s: "last" in s)
-    return proj, proj_id, stud_id, first, last
+    role = pick(lambda s: "role" in s, lambda s: "title" in s,
+                lambda s: "position" in s)
+    return proj, proj_id, stud_id, first, last, role
 
 
 def roster_df_for_fy(fy):
@@ -158,7 +160,7 @@ def roster_rows_for_fy(fy):
     df = roster_df_for_fy(fy)
     if df.empty:
         return []
-    cP, cPID, cSID, cF, cL = _roster_cols(df)
+    cP, cPID, cSID, cF, cL, cR = _roster_cols(df)
     rows = []
     for _, r in df.iterrows():
         def g(c):
@@ -169,6 +171,7 @@ def roster_rows_for_fy(fy):
             "pname": g(cP) or g(cPID),
             "sid": g(cSID),
             "name": name or g(cSID),
+            "role": g(cR),
         })
     return [r for r in rows if r["pid"] and r["sid"]]
 
@@ -228,7 +231,7 @@ def render_hours_grid(fy):
     rows = []
     for s in students:
         rec = hroot.get(s["sid"], {})
-        row = {"Student ID": s["sid"], "Name": s["name"]}
+        row = {"Student ID": s["sid"], "Name": s["name"], "Role": s.get("role", "")}
         for w in all_weeks:
             row[w] = float(rec.get(w, 0.0))
         rows.append(row)
@@ -239,10 +242,11 @@ def render_hours_grid(fy):
     edited = st.data_editor(
         grid, use_container_width=True, hide_index=True, num_rows="fixed",
         key=f"hrs_grid_{fy}_{pid}_{len(all_weeks)}",
-        disabled=["Student ID", "Name"],
+        disabled=["Student ID", "Name", "Role"],
         column_config={
             "Student ID": st.column_config.TextColumn("Student ID"),
             "Name": st.column_config.TextColumn("Name"),
+            "Role": st.column_config.TextColumn("Role"),
             **week_cfg,
         },
     )
