@@ -218,27 +218,36 @@ def _week_start(d: date) -> date:
 
 def _week_label(sat: date) -> str:
     """Compact Sat→Fri range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
-    fri = sat + timedelta(days=6)
-    if sat.month == fri.month:
-        return f"{sat:%b} {sat.day}–{fri.day}"
-    return f"{sat:%b} {sat.day} – {fri:%b} {fri.day}"
+    return _range_label(sat, sat + timedelta(days=6))
+
+
+def _range_label(a: date, b: date) -> str:
+    """Compact date range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
+    if a.month == b.month:
+        return f"{a:%b} {a.day}–{b.day}"
+    return f"{a:%b} {a.day} – {b:%b} {b.day}"
 
 
 def fy_weeks(fy_lbl):
-    """All Saturday-start weeks of a fiscal year (June 1 → May 31), extended so
-    the first/last weeks fully include their boundary days. Returns a list of
-    (saturday_date, is_split) where is_split flags a week that straddles the
-    FY boundary (shares days with an adjacent fiscal year)."""
+    """Saturday→Friday weeks of a fiscal year (June 1 → May 31), kept entirely
+    inside the year. If the FY doesn't begin on a Saturday, the leading days are
+    folded into the first full week; if it doesn't end on a Friday, the trailing
+    days are folded into the last full week — those become 'extended' weeks.
+    Returns a list of (saturday_key, display_start, display_end, is_extended)."""
     fy_s, fy_e = fy_range(fy_lbl)
     if not fy_s:
         return []
-    first = _week_start(fy_s)          # Saturday on/before June 1 (may be in May)
-    last = _week_start(fy_e)           # Saturday on/before May 31
-    out, w = [], first
-    while w <= last:
-        fri = w + timedelta(days=6)
-        split = (w < fy_s) or (fri > fy_e)
-        out.append((w, split))
+    first_sat = fy_s + timedelta(days=(5 - fy_s.weekday()) % 7)   # 1st Sat ≥ start
+    last_fri = fy_e - timedelta(days=(fy_e.weekday() - 4) % 7)    # last Fri ≤ end
+    last_sat = last_fri - timedelta(days=6)
+    out, w = [], first_sat
+    while w <= last_sat:
+        ds, de, ext = w, w + timedelta(days=6), False
+        if w == first_sat and fy_s < first_sat:
+            ds, ext = fy_s, True                 # fold leading days in
+        if w == last_sat and fy_e > de:
+            de, ext = fy_e, True                 # fold trailing days in
+        out.append((w, ds, de, ext))
         w += timedelta(days=7)
     return out
 
@@ -269,37 +278,36 @@ def render_hours_grid(fy):
         return
     students = [master.get(sid, {"sid": sid, "name": sid, "role": ""}) for sid in sids]
 
-    # Saturday-only week picker bounded to the FY (boundary weeks flagged 🔴).
+    # Saturday week picker bounded to the FY. The first/last weeks may be
+    # 'extended' (they absorb FY-boundary days that don't fall on Sat/Fri).
     weeks = fy_weeks(fy)
     if not weeks:
         st.error("Couldn't work out the weeks for this fiscal year.")
         return
-    split_set = {w.strftime("%Y-%m-%d") for w, sp in weeks if sp}
+    ext_set = {w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks if ext}
     today = date.today()
     default_idx = len(weeks) - 1
-    for idx, (w, _) in enumerate(weeks):
-        if w <= today <= w + timedelta(days=6):
+    for idx, (w, ds, de, ext) in enumerate(weeks):
+        if ds <= today <= de:
             default_idx = idx
             break
-    opt_labels = [_week_label(w) + ("   🔴 spans FY boundary" if sp else "")
-                  for w, sp in weeks]
+    opt_labels = [_range_label(ds, de) + ("   ⤢ extended week" if ext else "")
+                  for w, ds, de, ext in weeks]
     sel_label = st.selectbox(
-        "Week to log (Saturdays only — bounded to this fiscal year)",
+        "Week to log (Saturday start — bounded to this fiscal year)",
         opt_labels, index=default_idx, key=f"hrs_week_{fy}")
     sel_index = opt_labels.index(sel_label)
-    sel_sat, sel_split = weeks[sel_index]
-    sel_fri = sel_sat + timedelta(days=6)
-    if sel_split:
-        st.error(f"🔴 Week {_week_label(sel_sat)} (Sat {sel_sat:%Y-%m-%d} → "
-                 f"Fri {sel_fri:%Y-%m-%d}) spans the fiscal-year boundary — it "
-                 "shares days with an adjacent fiscal year. Hours logged here are "
-                 "counted in this fiscal year.")
+    sel_sat, sel_ds, sel_de, sel_ext = weeks[sel_index]
+    if sel_ext:
+        st.info(f"⤢ Extended week {_range_label(sel_ds, sel_de)} "
+                f"({sel_ds:%Y-%m-%d} → {sel_de:%Y-%m-%d}) — the fiscal year "
+                "doesn't start on a Saturday / end on a Friday, so the boundary "
+                "days are folded into this week.")
 
     # Rolling 4-week window: the selected week plus the 3 weeks before it.
     window = weeks[max(0, sel_index - 3): sel_index + 1]
-    win_weeks = [w.strftime("%Y-%m-%d") for w, _ in window]
-    st.caption(f"Showing the rolling 4 weeks ending **{_week_label(sel_sat)}** "
-               f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_fri:%Y-%m-%d}). "
+    win_weeks = [w.strftime("%Y-%m-%d") for w, ds, de, ext in window]
+    st.caption(f"Showing the rolling 4 weeks ending **{_range_label(sel_ds, sel_de)}**. "
                "“FY total” counts every week logged this year for this project.")
 
     hroot = H().get("hours", {}).get(fy, {}).get(pname, {})
@@ -315,12 +323,16 @@ def render_hours_grid(fy):
         rows.append(row)
     grid = pd.DataFrame(rows)
 
+    # Map each Saturday key to its display range for headers/labels.
+    wk_disp = {w.strftime("%Y-%m-%d"): (ds, de) for w, ds, de, ext in weeks}
+
     def _wk_header(w):
-        d = parse_date(w)
-        base = _week_label(d) if d else w
-        return ("🔴 " + base) if w in split_set else base
+        ds_de = wk_disp.get(w)
+        base = _range_label(*ds_de) if ds_de else w
+        return ("⤢ " + base) if w in ext_set else base
     week_cfg = {w: st.column_config.NumberColumn(
-        _wk_header(w), help=f"Week of {w} (Sat–Fri)",
+        _wk_header(w), help=f"Week of {w}"
+        + (" (extended — folds in FY-boundary days)" if w in ext_set else " (Sat–Fri)"),
         min_value=0.0, step=0.5, format="%g") for w in win_weeks}
     edited = st.data_editor(
         grid, use_container_width=True, hide_index=True, num_rows="fixed",
@@ -354,14 +366,13 @@ def render_hours_grid(fy):
     # Fixed bi-weekly bucket (FY weeks paired from the start, NOT rolling).
     b = sel_index // 2
     bw = weeks[2 * b: 2 * b + 2]
-    bw_keys = [w.strftime("%Y-%m-%d") for w, _ in bw]
-    bw_lbl = (f"{bw[0][0]:%b %d}–{(bw[-1][0] + timedelta(days=6)):%b %d}"
-              if bw else "—")
+    bw_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in bw]
+    bw_lbl = (_range_label(bw[0][1], bw[-1][2]) if bw else "—")
 
-    # Calendar month of the selected week.
-    month_keys = [w.strftime("%Y-%m-%d") for w, _ in weeks
+    # Calendar month of the selected week (by its Saturday key).
+    month_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks
                   if (w.year, w.month) == (sel_sat.year, sel_sat.month)]
-    all_fy_keys = [w.strftime("%Y-%m-%d") for w, _ in weeks]
+    all_fy_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks]
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Team size", len(students))
