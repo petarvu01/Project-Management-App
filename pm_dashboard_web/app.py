@@ -5,7 +5,7 @@ import numpy as np
 import json
 import base64
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy, fy_range,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
 from data import (load_data, save_data, blank_project, blank_line,
@@ -78,10 +78,11 @@ def _hours_fetch() -> dict:
         return None
 
 
-def _hours_write(data: dict) -> bool:
+def _hours_write(data: dict) -> int:
+    """PATCH the hours Gist. Returns the HTTP status code (or -1 on exception)."""
     t, g = _hours_cfg()
     if not t or not g:
-        return False
+        return 0
     try:
         r = _requests.patch(
             f"https://api.github.com/gists/{g}",
@@ -89,9 +90,9 @@ def _hours_write(data: dict) -> bool:
                      "Accept": "application/vnd.github+json"},
             json={"files": {HOURS_FILENAME: {"content": json.dumps(data, indent=2)}}},
             timeout=10)
-        return r.status_code == 200
+        return r.status_code
     except Exception:
-        return False
+        return -1
 
 
 def load_hours() -> dict:
@@ -116,11 +117,19 @@ def save_hours(updater):
         st.toast("⚠️ Couldn't reach the hours store — not saved.", icon="⚠️")
         return False
     updater(fresh)
-    ok = _hours_write(fresh)
+    status = _hours_write(fresh)
+    ok = status == 200
     st.session_state.hours_data = fresh
     if not ok:
-        st.toast("⚠️ Hours save failed — check the [student_hours] token/Gist.",
-                 icon="⚠️")
+        hint = {
+            401: "bad token (401)",
+            403: "token is missing the 'gist' scope (403)",
+            404: "wrong gist_id, or this token doesn't own that Gist (404)",
+            422: "request rejected by GitHub (422)",
+            -1: "network error",
+        }.get(status, f"HTTP {status}")
+        st.toast(f"⚠️ Hours save failed — {hint}. Check the [student_hours] "
+                 "token & gist_id.", icon="⚠️")
     return ok
 
 
@@ -263,6 +272,7 @@ def render_hours_grid(fy):
         def _upd(hd):
             root = (hd.setdefault("hours", {}).setdefault(fy, {})
                     .setdefault(pid, {}))
+            total = 0.0
             for _, r in edited.iterrows():
                 sid = str(r["Student ID"])
                 rec = root.setdefault(sid, {})
@@ -273,13 +283,42 @@ def render_hours_grid(fy):
                         val = 0.0
                     if val > 0:
                         rec[w] = val
+                        total += val
                     elif w in rec:
                         del rec[w]
                 if not rec:
                     root.pop(sid, None)
+            # Activity log so the admin gets an alert about new submissions.
+            log = hd.setdefault("log", [])
+            log.append({
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "fy": fy, "pname": pick.split("·")[0].strip(),
+                "students": len(students), "total": round(total, 2),
+                "by": st.session_state.get("role", "?"),
+            })
+            del log[:-50]   # keep the last 50 entries
         if save_hours(_upd):
             st.toast("Hours saved")
             st.rerun()
+
+
+def hours_activity_alerts(days: int = 7):
+    """Recent hours submissions as (icon, category, project, details) tuples,
+    for the admin's Overview alert panel."""
+    out = []
+    log = H().get("log", []) if hours_configured() else []
+    cutoff = datetime.now() - timedelta(days=days)
+    for e in log:
+        try:
+            when = datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        if when < cutoff:
+            continue
+        out.append(("⏱️", "Hours logged", e.get("pname", "—"),
+                    f"{e.get('students', 0)} students · {e.get('total', 0):g} hrs "
+                    f"· {e.get('fy', '')} — {e.get('ts', '')}"))
+    return list(reversed(out))   # newest first
 
 
 # ─── Accounts / roles ────────────────────────────────────────────────────
@@ -853,6 +892,9 @@ if page == "Overview":
 
     with col_right:
         notifs = get_all_notifications(D())
+        # Admin also gets alerts when the hours logger submits new hours.
+        if can_edit():
+            notifs = list(notifs) + hours_activity_alerts()
 
         # A stable signature per alert lets us remember which ones were cleared.
         def _alert_sig(note):
@@ -2519,3 +2561,14 @@ elif page == "Student Hours":
     st.divider()
     st.subheader("Hours by project")
     render_hours_grid(fy)
+
+    # Recent submission activity from the hours logger.
+    log = H().get("log", []) if hours_configured() else []
+    if log:
+        with st.expander(f"🕘 Recent hours activity ({len(log)} entries)"):
+            recent = [{"When": e.get("ts", ""), "Project": e.get("pname", ""),
+                       "FY": e.get("fy", ""), "Students": e.get("students", 0),
+                       "Total hrs": e.get("total", 0), "By": e.get("by", "")}
+                      for e in reversed(log)]
+            st.dataframe(pd.DataFrame(recent), use_container_width=True,
+                         hide_index=True)
