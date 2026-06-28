@@ -337,12 +337,37 @@ def render_hours_grid(fy):
         },
     )
 
-    win_total = float(edited[win_weeks].sum().sum()) if win_weeks else 0.0
-    fy_proj_total = float(sum(sum(rec.values()) for rec in hroot.values()))
-    c1, c2, c3 = st.columns(3)
+    # Live overlay: saved hours + whatever is currently typed in the visible window,
+    # so the KPIs reflect edits before saving.
+    live = {}
+    for _, r in edited.iterrows():
+        live[str(r["Student ID"])] = {w: float(r[w] or 0) for w in win_weeks}
+
+    def hours_for(week_keys):
+        tot = 0.0
+        for sid in set(list(hroot.keys()) + list(live.keys())):
+            rec = dict(hroot.get(sid, {}))
+            rec.update(live.get(sid, {}))
+            tot += sum(rec.get(w, 0) or 0 for w in week_keys)
+        return tot
+
+    # Fixed bi-weekly bucket (FY weeks paired from the start, NOT rolling).
+    b = sel_index // 2
+    bw = weeks[2 * b: 2 * b + 2]
+    bw_keys = [w.strftime("%Y-%m-%d") for w, _ in bw]
+    bw_lbl = (f"{bw[0][0]:%b %d}–{(bw[-1][0] + timedelta(days=6)):%b %d}"
+              if bw else "—")
+
+    # Calendar month of the selected week.
+    month_keys = [w.strftime("%Y-%m-%d") for w, _ in weeks
+                  if (w.year, w.month) == (sel_sat.year, sel_sat.month)]
+    all_fy_keys = [w.strftime("%Y-%m-%d") for w, _ in weeks]
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Team size", len(students))
-    c2.metric("Hours in these 4 weeks", f"{win_total:g}")
-    c3.metric(f"{pname} — FY total", f"{fy_proj_total:g}")
+    c2.metric(f"Bi-weekly ({bw_lbl})", f"{hours_for(bw_keys):g}")
+    c3.metric(f"{sel_sat:%B} hours", f"{hours_for(month_keys):g}")
+    c4.metric(f"{pname} — FY total", f"{hours_for(all_fy_keys):g}")
 
     if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pname}"):
         def _upd(hd):
