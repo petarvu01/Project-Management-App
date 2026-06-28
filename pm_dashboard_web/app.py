@@ -198,6 +198,25 @@ def _week_label(sat: date) -> str:
     return f"{sat:%b} {sat.day} – {fri:%b} {fri.day}"
 
 
+def fy_weeks(fy_lbl):
+    """All Saturday-start weeks of a fiscal year (June 1 → May 31), extended so
+    the first/last weeks fully include their boundary days. Returns a list of
+    (saturday_date, is_split) where is_split flags a week that straddles the
+    FY boundary (shares days with an adjacent fiscal year)."""
+    fy_s, fy_e = fy_range(fy_lbl)
+    if not fy_s:
+        return []
+    first = _week_start(fy_s)          # Saturday on/before June 1 (may be in May)
+    last = _week_start(fy_e)           # Saturday on/before May 31
+    out, w = [], first
+    while w <= last:
+        fri = w + timedelta(days=6)
+        split = (w < fy_s) or (fri > fy_e)
+        out.append((w, split))
+        w += timedelta(days=7)
+    return out
+
+
 def render_hours_grid(fy):
     """Project picker + editable weekly-hours grid + per-project total.
     Writes to the [student_hours] Gist via save_hours (read-fresh-then-write).
@@ -222,21 +241,42 @@ def render_hours_grid(fy):
     pid = labels[pick]
     students = [r for r in roster if r["pid"] == pid]
 
-    # Weeks run Saturday → Friday. A single calendar picks the week to log; its
-    # key depends only on the FY, so the chosen week stays put across projects.
+    # Saturday-only week picker, bounded to this fiscal year. Weeks that straddle
+    # the FY boundary are flagged 🔴 with a notice. The picker key depends only on
+    # the FY, so the chosen week stays put when you switch projects.
     hroot = H().get("hours", {}).get(fy, {}).get(pid, {})
     data_weeks = set()
     for s in students:
         data_weeks.update(hroot.get(s["sid"], {}).keys())
 
-    picked = st.date_input(
-        "Week to log — pick any day in it (weeks run Saturday → Friday)",
-        value=date.today(), key=f"hrs_cal_{fy}")
-    sel_sat = _week_start(picked)
+    weeks = fy_weeks(fy)
+    if not weeks:
+        st.error("Couldn't work out the weeks for this fiscal year.")
+        return
+    split_set = {w.strftime("%Y-%m-%d") for w, sp in weeks if sp}
+    today = date.today()
+    default_idx = 0
+    for idx, (w, _) in enumerate(weeks):
+        if w <= today <= w + timedelta(days=6):
+            default_idx = idx
+            break
+    opt_labels = [_week_label(w) + ("   🔴 spans FY boundary" if sp else "")
+                  for w, sp in weeks]
+    sel_label = st.selectbox(
+        "Week to log (Saturdays only — bounded to this fiscal year)",
+        opt_labels, index=default_idx, key=f"hrs_week_{fy}")
+    sel_sat, sel_split = weeks[opt_labels.index(sel_label)]
     sel_str = sel_sat.strftime("%Y-%m-%d")
-    st.caption(f"Logging week **{_week_label(sel_sat)}**  "
-               f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_sat + timedelta(days=6):%Y-%m-%d}). "
-               "Weeks already logged stay shown as columns.")
+    sel_fri = sel_sat + timedelta(days=6)
+    if sel_split:
+        st.error(f"🔴 Week {_week_label(sel_sat)} (Sat {sel_sat:%Y-%m-%d} → "
+                 f"Fri {sel_fri:%Y-%m-%d}) spans the fiscal-year boundary — it "
+                 "shares days with an adjacent fiscal year. Hours logged here are "
+                 "counted in this fiscal year.")
+    else:
+        st.caption(f"Logging week **{_week_label(sel_sat)}** "
+                   f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_fri:%Y-%m-%d}). "
+                   "Weeks already logged stay shown as columns.")
 
     all_weeks = sorted(set(data_weeks) | {sel_str})
 
@@ -252,7 +292,8 @@ def render_hours_grid(fy):
 
     def _wk_header(w):
         d = parse_date(w)
-        return _week_label(d) if d else w
+        base = _week_label(d) if d else w
+        return ("🔴 " + base) if w in split_set else base
     week_cfg = {w: st.column_config.NumberColumn(
         _wk_header(w), help=f"Week of {w} (Sat–Fri)",
         min_value=0.0, step=0.5, format="%g") for w in all_weeks}
