@@ -5,7 +5,7 @@ import numpy as np
 import json
 import base64
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy, fy_range,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
 from data import (load_data, save_data, blank_project, blank_line,
@@ -34,11 +34,256 @@ def D():
     return st.session_state.data
 
 
+# ─── Student-hours store (its own Gist; separate from main data) ──────────
+import requests as _requests
+
+HOURS_FILENAME = "student_hours.json"
+
+
+def _hours_cfg():
+    """(token, gist_id) for the student-hours Gist from secrets, or (None,None)."""
+    try:
+        sec = st.secrets["student_hours"]
+        return sec.get("token"), sec.get("gist_id")
+    except Exception:
+        return None, None
+
+
+def hours_configured() -> bool:
+    t, g = _hours_cfg()
+    return bool(t and g)
+
+
+def _hours_fetch() -> dict:
+    """Read the hours Gist fresh. Returns {} if empty, None on failure."""
+    t, g = _hours_cfg()
+    if not t or not g:
+        return None
+    try:
+        r = _requests.get(
+            f"https://api.github.com/gists/{g}",
+            headers={"Authorization": f"token {t}",
+                     "Accept": "application/vnd.github+json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        f = r.json().get("files", {}).get(HOURS_FILENAME)
+        if not f:
+            return {}
+        content = f.get("content", "")
+        if f.get("truncated") and f.get("raw_url"):
+            content = _requests.get(f["raw_url"], timeout=10).text
+        content = (content or "").strip()
+        return json.loads(content) if content else {}
+    except Exception:
+        return None
+
+
+def _hours_write(data: dict) -> bool:
+    t, g = _hours_cfg()
+    if not t or not g:
+        return False
+    try:
+        r = _requests.patch(
+            f"https://api.github.com/gists/{g}",
+            headers={"Authorization": f"token {t}",
+                     "Accept": "application/vnd.github+json"},
+            json={"files": {HOURS_FILENAME: {"content": json.dumps(data, indent=2)}}},
+            timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def load_hours() -> dict:
+    fetched = _hours_fetch()
+    return fetched if isinstance(fetched, dict) else {}
+
+
+def H():
+    if "hours_data" not in st.session_state:
+        st.session_state.hours_data = load_hours()
+    return st.session_state.hours_data
+
+
+def save_hours(updater):
+    """Read the hours Gist fresh, apply `updater(dict)` in place, then write —
+    so the admin and the hours account never overwrite each other."""
+    if st.session_state.get("role") not in ("editor", "hours"):
+        st.toast("This account can't change hours.", icon="👁️")
+        return False
+    fresh = _hours_fetch()
+    if fresh is None:
+        st.toast("⚠️ Couldn't reach the hours store — not saved.", icon="⚠️")
+        return False
+    updater(fresh)
+    ok = _hours_write(fresh)
+    st.session_state.hours_data = fresh
+    if not ok:
+        st.toast("⚠️ Hours save failed — check the [student_hours] token/Gist.",
+                 icon="⚠️")
+    return ok
+
+
+# ─── Roster readers (from the main Gist's Student Workers list) ───────────
+def _roster_cols(df):
+    """Map the roster's columns to (project, project_id, student_id, first, last)
+    by case-insensitive header matching."""
+    low = {str(c).strip().lower(): c for c in df.columns}
+
+    def pick(*tests):
+        for lc, orig in low.items():
+            if any(t(lc) for t in tests):
+                return orig
+        return None
+    proj_id = pick(lambda s: "project" in s and "id" in s)
+    proj = pick(lambda s: "project" in s and "id" not in s)
+    stud_id = pick(lambda s: "student" in s and "id" in s,
+                   lambda s: s == "id")
+    first = pick(lambda s: "first" in s)
+    last = pick(lambda s: "last" in s)
+    return proj, proj_id, stud_id, first, last
+
+
+def roster_df_for_fy(fy):
+    sw = D().get("student_workers", {})
+    target = _fy_year_of(fy)
+    for key, rec in sw.items():
+        if _fy_year_of(key) == target:
+            return store_to_df(rec)
+    return pd.DataFrame()
+
+
+def roster_rows_for_fy(fy):
+    """Normalized roster rows: list of dicts with pid, pname, sid, name."""
+    df = roster_df_for_fy(fy)
+    if df.empty:
+        return []
+    cP, cPID, cSID, cF, cL = _roster_cols(df)
+    rows = []
+    for _, r in df.iterrows():
+        def g(c):
+            return "" if c is None or pd.isna(r[c]) else str(r[c]).strip()
+        name = " ".join(x for x in (g(cF), g(cL)) if x).strip()
+        rows.append({
+            "pid": g(cPID) or g(cP),       # fall back to name if no ID column
+            "pname": g(cP) or g(cPID),
+            "sid": g(cSID),
+            "name": name or g(cSID),
+        })
+    return [r for r in rows if r["pid"] and r["sid"]]
+
+
+def _monday(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def render_hours_grid(fy):
+    """Project picker + editable weekly-hours grid + per-project total.
+    Writes to the [student_hours] Gist via save_hours (read-fresh-then-write).
+    Shared by the Hours Logger (3rd account) and admin Student Hours tab."""
+    if not hours_configured():
+        st.error("The hours store isn't set up yet. Add a **[student_hours]** "
+                 "section (gist_id + token) in the app's Secrets.")
+        return
+    roster = roster_rows_for_fy(fy)
+    if not roster:
+        st.info(f"No student workers are listed for {fy}. The admin adds them on "
+                "the Student Workers tab (Project, Project ID, Student ID, "
+                "First/Last name).")
+        return
+
+    projects = {}
+    for r in roster:
+        projects.setdefault(r["pid"], r["pname"])
+    labels = {f"{name}  ·  {pid}": pid
+              for pid, name in sorted(projects.items(), key=lambda kv: kv[1].lower())}
+    pick = st.selectbox("Project", list(labels.keys()), key=f"hrs_proj_{fy}")
+    pid = labels[pick]
+    students = [r for r in roster if r["pid"] == pid]
+
+    # Weeks shown = weeks already in the data + any added this session.
+    hroot = H().get("hours", {}).get(fy, {}).get(pid, {})
+    data_weeks = set()
+    for s in students:
+        data_weeks.update(hroot.get(s["sid"], {}).keys())
+    extra_key = f"hrs_weeks_{fy}_{pid}"
+    extra = st.session_state.setdefault(extra_key, [])
+    all_weeks = sorted(set(data_weeks) | set(extra))
+
+    # Add-a-week control (snaps to the Monday of the chosen week).
+    aw1, aw2 = st.columns([2, 1])
+    wk_pick = aw1.date_input("Add a week (any day in it)", value=date.today(),
+                             key=f"hrs_addweek_{fy}_{pid}")
+    if aw2.button("➕ Add week", key=f"hrs_addbtn_{fy}_{pid}"):
+        wk = _monday(wk_pick).strftime("%Y-%m-%d")
+        if wk not in all_weeks:
+            extra.append(wk)
+            st.rerun()
+
+    if not all_weeks:
+        st.caption("No weeks yet — add one above to start logging hours.")
+        return
+
+    # Build the editable grid: Student ID + Name (read-only) + a column per week.
+    rows = []
+    for s in students:
+        rec = hroot.get(s["sid"], {})
+        row = {"Student ID": s["sid"], "Name": s["name"]}
+        for w in all_weeks:
+            row[w] = float(rec.get(w, 0.0))
+        rows.append(row)
+    grid = pd.DataFrame(rows)
+
+    week_cfg = {w: st.column_config.NumberColumn(
+        f"wk {w}", min_value=0.0, step=0.5, format="%g") for w in all_weeks}
+    edited = st.data_editor(
+        grid, use_container_width=True, hide_index=True, num_rows="fixed",
+        key=f"hrs_grid_{fy}_{pid}_{len(all_weeks)}",
+        disabled=["Student ID", "Name"],
+        column_config={
+            "Student ID": st.column_config.TextColumn("Student ID"),
+            "Name": st.column_config.TextColumn("Name"),
+            **week_cfg,
+        },
+    )
+
+    # Per-student + per-project totals (live, from the edited grid).
+    wk_cols = list(all_weeks)
+    edited["Total"] = edited[wk_cols].sum(axis=1) if wk_cols else 0
+    proj_total = float(edited["Total"].sum()) if wk_cols else 0.0
+    c1, c2 = st.columns(2)
+    c1.metric("Students on this project", len(students))
+    c2.metric(f"{pick.split('·')[0].strip()} — total hours", f"{proj_total:g}")
+
+    if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pid}"):
+        def _upd(hd):
+            root = (hd.setdefault("hours", {}).setdefault(fy, {})
+                    .setdefault(pid, {}))
+            for _, r in edited.iterrows():
+                sid = str(r["Student ID"])
+                rec = root.setdefault(sid, {})
+                for w in wk_cols:
+                    try:
+                        val = float(r[w]) if r[w] not in (None, "") else 0.0
+                    except (TypeError, ValueError):
+                        val = 0.0
+                    if val > 0:
+                        rec[w] = val
+                    elif w in rec:
+                        del rec[w]
+                if not rec:
+                    root.pop(sid, None)
+        if save_hours(_upd):
+            st.toast("Hours saved")
+            st.rerun()
+
+
 # ─── Accounts / roles ────────────────────────────────────────────────────
 # Two accounts: a privileged editor and a read-only viewer. Passwords are read
 # from Streamlit secrets ([auth] editor_password / viewer_password) when set,
 # otherwise these defaults apply — change them in secrets for real security.
-ACCOUNTS = {"Privileged (full access)": "editor", "View only": "viewer"}
+ACCOUNTS = {"Privileged (full access)": "editor", "View only": "viewer",
+            "Hours logger": "hours"}
 
 
 def _account_pw(secret_key: str, default: str) -> str:
@@ -51,6 +296,7 @@ def _account_pw(secret_key: str, default: str) -> str:
 _PASSWORDS = {
     "editor": _account_pw("editor_password", "pm-admin"),
     "viewer": _account_pw("viewer_password", "pm-view"),
+    "hours": _account_pw("hours_password", "pm-hours"),
 }
 
 
@@ -440,7 +686,19 @@ with st.sidebar:
                 'letter-spacing: 0.08em; padding: 0 4px; margin-bottom: 6px;">MAIN</div>',
                 unsafe_allow_html=True)
 
-    for icon, label in NAV_ITEMS:
+    # Role-scoped navigation
+    _role = st.session_state.get("role")
+    if _role == "hours":
+        nav_items = [("⏱️", "Hours Logger")]
+    elif _role == "editor":
+        nav_items = NAV_ITEMS + [("⏱️", "Student Hours")]
+    else:
+        nav_items = NAV_ITEMS
+    _valid = [lbl for _, lbl in nav_items]
+    if st.session_state.page not in _valid:
+        st.session_state.page = _valid[0]
+
+    for icon, label in nav_items:
         is_active = st.session_state.page == label
         # Active state styling via markdown + button combo
         if is_active:
@@ -462,7 +720,8 @@ with st.sidebar:
 
     # ── Signed-in account + sign out (login happens on the centered gate) ──
     role = st.session_state.get("role")
-    badge = "🔑 Privileged" if role == "editor" else "👁️ View only"
+    badge = ({"editor": "🔑 Privileged", "viewer": "👁️ View only",
+              "hours": "⏱️ Hours logger"}).get(role, role or "")
     st.markdown(f"""
     <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
         <div style="width: 28px; height: 28px; border-radius: 50%;
@@ -477,17 +736,21 @@ with st.sidebar:
         st.session_state.pop("login_pw", None)
         st.rerun()
 
-    # Storage status + manual backup
-    if gist_configured():
-        st.caption("💾 Cloud storage: on (Gist)")
+    # Storage status + manual backup (not for the locked-down hours account)
+    if role != "hours":
+        if gist_configured():
+            st.caption("💾 Cloud storage: on (Gist)")
+        else:
+            st.caption("⚠️ Local only — data resets on redeploy")
+        st.download_button(
+            "⬇️ Download backup (JSON)",
+            json.dumps(st.session_state.data, indent=2),
+            "dashboard_progress.json", "application/json",
+            use_container_width=True, key="sidebar_backup",
+        )
     else:
-        st.caption("⚠️ Local only — data resets on redeploy")
-    st.download_button(
-        "⬇️ Download backup (JSON)",
-        json.dumps(st.session_state.data, indent=2),
-        "dashboard_progress.json", "application/json",
-        use_container_width=True, key="sidebar_backup",
-    )
+        st.caption("⏱️ Hours store: "
+                   + ("on" if hours_configured() else "not configured"))
 
 page = st.session_state.page
 
@@ -2205,3 +2468,50 @@ elif page == "Results":
             st.download_button("⬇️ Download CSV", csv,
                                f"results_per_project_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
                                "text/csv")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# HOURS LOGGER  (3rd account — logs weekly student hours only)
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Hours Logger":
+    st.title("⏱️ Weekly Hours")
+    st.caption("Pick a fiscal year and project, then enter each student worker's "
+               "hours for the week. Saved to the separate hours store.")
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_logger")
+    render_hours_grid(fy)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# STUDENT HOURS  (admin — view/edit all hours + multi-project roll-up)
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Student Hours":
+    st.title("⏱️ Student Hours Tracking")
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_admin")
+
+    # ── Students working on more than one project (by Student ID) ──
+    roster = roster_rows_for_fy(fy)
+    by_sid = {}
+    for r in roster:
+        rec = by_sid.setdefault(r["sid"], {"name": r["name"], "projects": {}})
+        rec["projects"][r["pid"]] = r["pname"]
+    multi = {sid: rec for sid, rec in by_sid.items() if len(rec["projects"]) > 1}
+    st.subheader("Students on multiple projects")
+    if multi:
+        hroot = H().get("hours", {}).get(fy, {})
+        rows = []
+        for sid, rec in sorted(multi.items()):
+            total = sum(sum(hroot.get(pid, {}).get(sid, {}).values())
+                        for pid in rec["projects"])
+            rows.append({
+                "Student ID": sid, "Name": rec["name"],
+                "# Projects": len(rec["projects"]),
+                "Projects": ", ".join(sorted(rec["projects"].values())),
+                f"Total hrs ({fy})": f"{total:g}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No student is assigned to more than one project this fiscal year.")
+
+    st.divider()
+    st.subheader("Hours by project")
+    render_hours_grid(fy)
