@@ -164,25 +164,51 @@ def roster_df_for_fy(fy):
     return pd.DataFrame()
 
 
-def roster_rows_for_fy(fy):
-    """Normalized roster rows: list of dicts with pid, pname, sid, name."""
+def student_master_for_fy(fy):
+    """Distinct students for a fiscal year (deduped by Student ID) from the
+    Student Workers sheet — just the people: sid, name, role."""
     df = roster_df_for_fy(fy)
     if df.empty:
         return []
-    cP, cPID, cSID, cF, cL, cR = _roster_cols(df)
-    rows = []
+    _, _, cSID, cF, cL, cR = _roster_cols(df)
+    seen = {}
     for _, r in df.iterrows():
         def g(c):
             return "" if c is None or pd.isna(r[c]) else str(r[c]).strip()
+        sid = g(cSID)
+        if not sid or sid in seen:
+            continue
         name = " ".join(x for x in (g(cF), g(cL)) if x).strip()
-        rows.append({
-            "pid": g(cPID) or g(cP),       # fall back to name if no ID column
-            "pname": g(cP) or g(cPID),
-            "sid": g(cSID),
-            "name": name or g(cSID),
-            "role": g(cR),
-        })
-    return [r for r in rows if r["pid"] and r["sid"]]
+        seen[sid] = {"sid": sid, "name": name or sid, "role": g(cR)}
+    return sorted(seen.values(), key=lambda s: s["name"].lower())
+
+
+def real_projects(fy):
+    """Project names active in the fiscal year, from Project View."""
+    return sorted([name for name, proj in D().get("project_records", {}).items()
+                   if project_in_fy(proj, fy)], key=str.lower)
+
+
+def assigned_sids(fy, pname):
+    """Student IDs assigned to a project for a FY (from the hours Gist)."""
+    return list(H().get("assignments", {}).get(fy, {}).get(pname, []))
+
+
+def set_assignment(fy, pname, sids):
+    """Admin: set a project's team for a FY (writes to the hours Gist)."""
+    def _upd(hd):
+        a = hd.setdefault("assignments", {}).setdefault(fy, {})
+        if sids:
+            a[pname] = list(dict.fromkeys(sids))   # de-dup, keep order
+        else:
+            a.pop(pname, None)
+    return save_hours(_upd)
+
+
+def student_projects(fy, sid):
+    """Projects a student is assigned to this FY (for the multi-project view)."""
+    amap = H().get("assignments", {}).get(fy, {})
+    return [p for p, sids in amap.items() if sid in sids]
 
 
 def _week_start(d: date) -> date:
@@ -218,44 +244,39 @@ def fy_weeks(fy_lbl):
 
 
 def render_hours_grid(fy):
-    """Project picker + editable weekly-hours grid + per-project total.
-    Writes to the [student_hours] Gist via save_hours (read-fresh-then-write).
+    """Editable weekly-hours grid for a project's assigned team — rolling 4-week
+    window (selected week + 3 prior). Writes to the [student_hours] Gist.
     Shared by the Hours Logger (3rd account) and admin Student Hours tab."""
     if not hours_configured():
         st.error("The hours store isn't set up yet. Add a **[student_hours]** "
                  "section (gist_id + token) in the app's Secrets.")
         return
-    roster = roster_rows_for_fy(fy)
-    if not roster:
-        st.info(f"No student workers are listed for {fy}. The admin adds them on "
-                "the Student Workers tab (Project, Project ID, Student ID, "
-                "First/Last name).")
+    projects = real_projects(fy)
+    if not projects:
+        st.info(f"No projects are active in {fy}. Create them in Project View first.")
         return
+    master = {s["sid"]: s for s in student_master_for_fy(fy)}
 
-    projects = {}
-    for r in roster:
-        projects.setdefault(r["pid"], r["pname"])
-    labels = {f"{name}  ·  {pid}": pid
-              for pid, name in sorted(projects.items(), key=lambda kv: kv[1].lower())}
-    pick = st.selectbox("Project", list(labels.keys()), key=f"hrs_proj_{fy}")
-    pid = labels[pick]
-    students = [r for r in roster if r["pid"] == pid]
+    pname = st.selectbox("Project", projects, key=f"hrs_proj_{fy}")
+    sids = assigned_sids(fy, pname)
+    if not sids:
+        if can_edit():
+            st.info(f"No team is assigned to **{pname}** for {fy} yet. "
+                    "Assign students in the Team assignments section above.")
+        else:
+            st.info(f"No team is assigned to **{pname}** for {fy} yet. "
+                    "Ask the admin to assign the team.")
+        return
+    students = [master.get(sid, {"sid": sid, "name": sid, "role": ""}) for sid in sids]
 
-    # Saturday-only week picker, bounded to this fiscal year. Weeks that straddle
-    # the FY boundary are flagged 🔴 with a notice. The picker key depends only on
-    # the FY, so the chosen week stays put when you switch projects.
-    hroot = H().get("hours", {}).get(fy, {}).get(pid, {})
-    data_weeks = set()
-    for s in students:
-        data_weeks.update(hroot.get(s["sid"], {}).keys())
-
+    # Saturday-only week picker bounded to the FY (boundary weeks flagged 🔴).
     weeks = fy_weeks(fy)
     if not weeks:
         st.error("Couldn't work out the weeks for this fiscal year.")
         return
     split_set = {w.strftime("%Y-%m-%d") for w, sp in weeks if sp}
     today = date.today()
-    default_idx = 0
+    default_idx = len(weeks) - 1
     for idx, (w, _) in enumerate(weeks):
         if w <= today <= w + timedelta(days=6):
             default_idx = idx
@@ -265,28 +286,32 @@ def render_hours_grid(fy):
     sel_label = st.selectbox(
         "Week to log (Saturdays only — bounded to this fiscal year)",
         opt_labels, index=default_idx, key=f"hrs_week_{fy}")
-    sel_sat, sel_split = weeks[opt_labels.index(sel_label)]
-    sel_str = sel_sat.strftime("%Y-%m-%d")
+    sel_index = opt_labels.index(sel_label)
+    sel_sat, sel_split = weeks[sel_index]
     sel_fri = sel_sat + timedelta(days=6)
     if sel_split:
         st.error(f"🔴 Week {_week_label(sel_sat)} (Sat {sel_sat:%Y-%m-%d} → "
                  f"Fri {sel_fri:%Y-%m-%d}) spans the fiscal-year boundary — it "
                  "shares days with an adjacent fiscal year. Hours logged here are "
                  "counted in this fiscal year.")
-    else:
-        st.caption(f"Logging week **{_week_label(sel_sat)}** "
-                   f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_fri:%Y-%m-%d}). "
-                   "Weeks already logged stay shown as columns.")
 
-    all_weeks = sorted(set(data_weeks) | {sel_str})
+    # Rolling 4-week window: the selected week plus the 3 weeks before it.
+    window = weeks[max(0, sel_index - 3): sel_index + 1]
+    win_weeks = [w.strftime("%Y-%m-%d") for w, _ in window]
+    st.caption(f"Showing the rolling 4 weeks ending **{_week_label(sel_sat)}** "
+               f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_fri:%Y-%m-%d}). "
+               "“FY total” counts every week logged this year for this project.")
 
-    # Build the editable grid: Student ID + Name + Role (read-only) + a column per week.
+    hroot = H().get("hours", {}).get(fy, {}).get(pname, {})
+
+    # Build grid: Student ID + Name + Role (read-only) + 4 week cols + FY total.
     rows = []
     for s in students:
         rec = hroot.get(s["sid"], {})
         row = {"Student ID": s["sid"], "Name": s["name"], "Role": s.get("role", "")}
-        for w in all_weeks:
+        for w in win_weeks:
             row[w] = float(rec.get(w, 0.0))
+        row["FY total"] = float(sum(rec.values()))   # all weeks, not just shown
         rows.append(row)
     grid = pd.DataFrame(rows)
 
@@ -296,36 +321,38 @@ def render_hours_grid(fy):
         return ("🔴 " + base) if w in split_set else base
     week_cfg = {w: st.column_config.NumberColumn(
         _wk_header(w), help=f"Week of {w} (Sat–Fri)",
-        min_value=0.0, step=0.5, format="%g") for w in all_weeks}
+        min_value=0.0, step=0.5, format="%g") for w in win_weeks}
     edited = st.data_editor(
         grid, use_container_width=True, hide_index=True, num_rows="fixed",
-        key=f"hrs_grid_{fy}_{pid}_{'_'.join(all_weeks)}",
-        disabled=["Student ID", "Name", "Role"],
+        key=f"hrs_grid_{fy}_{pname}_{'_'.join(win_weeks)}",
+        disabled=["Student ID", "Name", "Role", "FY total"],
         column_config={
             "Student ID": st.column_config.TextColumn("Student ID"),
             "Name": st.column_config.TextColumn("Name"),
             "Role": st.column_config.TextColumn("Role"),
+            "FY total": st.column_config.NumberColumn(
+                "FY total", help="This student's total hours for the whole FY on "
+                "this project (all weeks).", format="%g"),
             **week_cfg,
         },
     )
 
-    # Per-student + per-project totals (live, from the edited grid).
-    wk_cols = list(all_weeks)
-    edited["Total"] = edited[wk_cols].sum(axis=1) if wk_cols else 0
-    proj_total = float(edited["Total"].sum()) if wk_cols else 0.0
-    c1, c2 = st.columns(2)
-    c1.metric("Students on this project", len(students))
-    c2.metric(f"{pick.split('·')[0].strip()} — total hours", f"{proj_total:g}")
+    win_total = float(edited[win_weeks].sum().sum()) if win_weeks else 0.0
+    fy_proj_total = float(sum(sum(rec.values()) for rec in hroot.values()))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Team size", len(students))
+    c2.metric("Hours in these 4 weeks", f"{win_total:g}")
+    c3.metric(f"{pname} — FY total", f"{fy_proj_total:g}")
 
-    if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pid}"):
+    if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pname}"):
         def _upd(hd):
             root = (hd.setdefault("hours", {}).setdefault(fy, {})
-                    .setdefault(pid, {}))
+                    .setdefault(pname, {}))
             total = 0.0
             for _, r in edited.iterrows():
                 sid = str(r["Student ID"])
                 rec = root.setdefault(sid, {})
-                for w in wk_cols:
+                for w in win_weeks:
                     try:
                         val = float(r[w]) if r[w] not in (None, "") else 0.0
                     except (TypeError, ValueError):
@@ -337,17 +364,43 @@ def render_hours_grid(fy):
                         del rec[w]
                 if not rec:
                     root.pop(sid, None)
-            # Activity log so the admin gets an alert about new submissions.
             log = hd.setdefault("log", [])
             log.append({
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "fy": fy, "pname": pick.split("·")[0].strip(),
+                "fy": fy, "pname": pname,
                 "students": len(students), "total": round(total, 2),
                 "by": st.session_state.get("role", "?"),
             })
-            del log[:-50]   # keep the last 50 entries
+            del log[:-50]
         if save_hours(_upd):
             st.toast("Hours saved")
+            st.rerun()
+
+
+def render_team_assignment(fy):
+    """Admin: assign each project's team for a FY from the student master list."""
+    projects = real_projects(fy)
+    master = student_master_for_fy(fy)
+    if not projects:
+        st.info("No projects in this fiscal year yet — add them in Project View.")
+        return
+    if not master:
+        st.info("No students found for this FY. Add the student list on the "
+                "Student Workers tab (Student ID, First/Last name, Role).")
+        return
+    pname = st.selectbox("Project to staff", projects, key=f"assign_proj_{fy}")
+    options = {}
+    for s in master:
+        lbl = f'{s["name"]} ({s["sid"]})' + (f' — {s["role"]}' if s["role"] else "")
+        options[lbl] = s["sid"]
+    current = set(assigned_sids(fy, pname))
+    default_labels = [lbl for lbl, sid in options.items() if sid in current]
+    chosen = st.multiselect(f"Team on {pname}", list(options.keys()),
+                            default=default_labels, key=f"assign_ms_{fy}_{pname}")
+    if st.button("💾 Save team", type="primary", key=f"assign_save_{fy}_{pname}"):
+        sids = [options[l] for l in chosen]
+        if set_assignment(fy, pname, sids):
+            st.toast(f"Saved {len(sids)} students to {pname}")
             st.rerun()
 
 
@@ -2577,37 +2630,65 @@ elif page == "Hours Logger":
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# STUDENT HOURS  (admin — view/edit all hours + multi-project roll-up)
+# STUDENT HOURS  (admin — assign teams, view/edit hours, totals & roll-ups)
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Student Hours":
     st.title("⏱️ Student Hours Tracking")
     fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_admin")
 
-    # ── Students working on more than one project (by Student ID) ──
-    roster = roster_rows_for_fy(fy)
-    by_sid = {}
-    for r in roster:
-        rec = by_sid.setdefault(r["sid"], {"name": r["name"], "projects": {}})
-        rec["projects"][r["pid"]] = r["pname"]
-    multi = {sid: rec for sid, rec in by_sid.items() if len(rec["projects"]) > 1}
-    st.subheader("Students on multiple projects")
-    if multi:
-        hroot = H().get("hours", {}).get(fy, {})
+    master = {s["sid"]: s for s in student_master_for_fy(fy)}
+    amap = H().get("assignments", {}).get(fy, {})
+    hroot = H().get("hours", {}).get(fy, {})
+
+    # ── Assign each project's team ──
+    st.subheader("Team assignments")
+    st.caption("Assign students to each project for this fiscal year. The hours "
+               "logger fills in weekly hours for whoever is on the team.")
+    render_team_assignment(fy)
+
+    st.divider()
+
+    # ── Per-student totals (live from hours data; survives roster changes) ──
+    st.subheader("Totals per student")
+    # Every student who appears in assignments OR has logged hours this FY.
+    all_sids = set(s for sids in amap.values() for s in sids)
+    for pproj in hroot.values():
+        all_sids.update(pproj.keys())
+    if all_sids:
         rows = []
-        for sid, rec in sorted(multi.items()):
-            total = sum(sum(hroot.get(pid, {}).get(sid, {}).values())
-                        for pid in rec["projects"])
+        for sid in sorted(all_sids):
+            info = master.get(sid, {"name": sid, "role": ""})
+            per_proj = {p: sum(hroot.get(p, {}).get(sid, {}).values())
+                        for p in set(list(amap.keys()) + list(hroot.keys()))}
+            per_proj = {p: v for p, v in per_proj.items() if v or sid in amap.get(p, [])}
+            total = sum(per_proj.values())
+            breakdown = ", ".join(f"{p}: {v:g}" for p, v in sorted(per_proj.items()) if v)
             rows.append({
-                "Student ID": sid, "Name": rec["name"],
-                "# Projects": len(rec["projects"]),
-                "Projects": ", ".join(sorted(rec["projects"].values())),
-                f"Total hrs ({fy})": f"{total:g}",
+                "Student ID": sid, "Name": info.get("name", sid),
+                "Role": info.get("role", ""),
+                "# Projects": len([p for p in per_proj if per_proj[p] or sid in amap.get(p, [])]),
+                f"FY total ({fy})": f"{total:g}",
+                "By project": breakdown or "—",
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.caption("No student is assigned to more than one project this fiscal year.")
+        st.caption("No students assigned or logged yet for this fiscal year.")
+
+    # ── Students on more than one project (by Student ID) ──
+    multi = {sid: [p for p, sids in amap.items() if sid in sids] for sid in
+             set(s for sids in amap.values() for s in sids)}
+    multi = {sid: ps for sid, ps in multi.items() if len(ps) > 1}
+    if multi:
+        st.markdown("**On multiple projects:**")
+        mrows = [{"Student ID": sid,
+                  "Name": master.get(sid, {}).get("name", sid),
+                  "# Projects": len(ps), "Projects": ", ".join(sorted(ps))}
+                 for sid, ps in sorted(multi.items())]
+        st.dataframe(pd.DataFrame(mrows), use_container_width=True, hide_index=True)
 
     st.divider()
+
+    # ── Edit hours by project (rolling 4 weeks) ──
     st.subheader("Hours by project")
     render_hours_grid(fy)
 
