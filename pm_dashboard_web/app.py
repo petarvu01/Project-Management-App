@@ -185,8 +185,17 @@ def roster_rows_for_fy(fy):
     return [r for r in rows if r["pid"] and r["sid"]]
 
 
-def _monday(d: date) -> date:
-    return d - timedelta(days=d.weekday())
+def _week_start(d: date) -> date:
+    """The Saturday on or before d (weeks run Saturday → Friday)."""
+    return d - timedelta(days=(d.weekday() - 5) % 7)
+
+
+def _week_label(sat: date) -> str:
+    """Compact Sat→Fri range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
+    fri = sat + timedelta(days=6)
+    if sat.month == fri.month:
+        return f"{sat:%b} {sat.day}–{fri.day}"
+    return f"{sat:%b} {sat.day} – {fri:%b} {fri.day}"
 
 
 def render_hours_grid(fy):
@@ -213,30 +222,25 @@ def render_hours_grid(fy):
     pid = labels[pick]
     students = [r for r in roster if r["pid"] == pid]
 
-    # Weeks shown = weeks already in the data + any added this session.
+    # Weeks run Saturday → Friday. A single calendar picks the week to log; its
+    # key depends only on the FY, so the chosen week stays put across projects.
     hroot = H().get("hours", {}).get(fy, {}).get(pid, {})
     data_weeks = set()
     for s in students:
         data_weeks.update(hroot.get(s["sid"], {}).keys())
-    extra_key = f"hrs_weeks_{fy}_{pid}"
-    extra = st.session_state.setdefault(extra_key, [])
-    all_weeks = sorted(set(data_weeks) | set(extra))
 
-    # Add-a-week control (snaps to the Monday of the chosen week).
-    aw1, aw2 = st.columns([2, 1])
-    wk_pick = aw1.date_input("Add a week (any day in it)", value=date.today(),
-                             key=f"hrs_addweek_{fy}_{pid}")
-    if aw2.button("➕ Add week", key=f"hrs_addbtn_{fy}_{pid}"):
-        wk = _monday(wk_pick).strftime("%Y-%m-%d")
-        if wk not in all_weeks:
-            extra.append(wk)
-            st.rerun()
+    picked = st.date_input(
+        "Week to log — pick any day in it (weeks run Saturday → Friday)",
+        value=date.today(), key=f"hrs_cal_{fy}")
+    sel_sat = _week_start(picked)
+    sel_str = sel_sat.strftime("%Y-%m-%d")
+    st.caption(f"Logging week **{_week_label(sel_sat)}**  "
+               f"(Sat {sel_sat:%Y-%m-%d} → Fri {sel_sat + timedelta(days=6):%Y-%m-%d}). "
+               "Weeks already logged stay shown as columns.")
 
-    if not all_weeks:
-        st.caption("No weeks yet — add one above to start logging hours.")
-        return
+    all_weeks = sorted(set(data_weeks) | {sel_str})
 
-    # Build the editable grid: Student ID + Name (read-only) + a column per week.
+    # Build the editable grid: Student ID + Name + Role (read-only) + a column per week.
     rows = []
     for s in students:
         rec = hroot.get(s["sid"], {})
@@ -246,11 +250,15 @@ def render_hours_grid(fy):
         rows.append(row)
     grid = pd.DataFrame(rows)
 
+    def _wk_header(w):
+        d = parse_date(w)
+        return _week_label(d) if d else w
     week_cfg = {w: st.column_config.NumberColumn(
-        f"wk {w}", min_value=0.0, step=0.5, format="%g") for w in all_weeks}
+        _wk_header(w), help=f"Week of {w} (Sat–Fri)",
+        min_value=0.0, step=0.5, format="%g") for w in all_weeks}
     edited = st.data_editor(
         grid, use_container_width=True, hide_index=True, num_rows="fixed",
-        key=f"hrs_grid_{fy}_{pid}_{len(all_weeks)}",
+        key=f"hrs_grid_{fy}_{pid}_{'_'.join(all_weeks)}",
         disabled=["Student ID", "Name", "Role"],
         column_config={
             "Student ID": st.column_config.TextColumn("Student ID"),
