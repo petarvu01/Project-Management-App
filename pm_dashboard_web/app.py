@@ -211,16 +211,6 @@ def student_projects(fy, sid):
     return [p for p, sids in amap.items() if sid in sids]
 
 
-def _week_start(d: date) -> date:
-    """The Saturday on or before d (weeks run Saturday → Friday)."""
-    return d - timedelta(days=(d.weekday() - 5) % 7)
-
-
-def _week_label(sat: date) -> str:
-    """Compact Sat→Fri range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
-    return _range_label(sat, sat + timedelta(days=6))
-
-
 def _range_label(a: date, b: date) -> str:
     """Compact date range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
     if a.month == b.month:
@@ -349,36 +339,38 @@ def render_hours_grid(fy):
         },
     )
 
-    # Live overlay: saved hours + whatever is currently typed in the visible window,
-    # so the KPIs reflect edits before saving.
-    live = {}
-    for _, r in edited.iterrows():
-        live[str(r["Student ID"])] = {w: float(r[w] or 0) for w in win_weeks}
+    # KPI cards are for the admin only — the hours logger just enters hours.
+    if can_edit():
+        # Live overlay: saved hours + whatever is currently typed in the visible
+        # window, so the KPIs reflect edits before saving.
+        live = {}
+        for _, r in edited.iterrows():
+            live[str(r["Student ID"])] = {w: float(r[w] or 0) for w in win_weeks}
 
-    def hours_for(week_keys):
-        tot = 0.0
-        for sid in set(list(hroot.keys()) + list(live.keys())):
-            rec = dict(hroot.get(sid, {}))
-            rec.update(live.get(sid, {}))
-            tot += sum(rec.get(w, 0) or 0 for w in week_keys)
-        return tot
+        def hours_for(week_keys):
+            tot = 0.0
+            for sid in set(list(hroot.keys()) + list(live.keys())):
+                rec = dict(hroot.get(sid, {}))
+                rec.update(live.get(sid, {}))
+                tot += sum(rec.get(w, 0) or 0 for w in week_keys)
+            return tot
 
-    # Fixed bi-weekly bucket (FY weeks paired from the start, NOT rolling).
-    b = sel_index // 2
-    bw = weeks[2 * b: 2 * b + 2]
-    bw_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in bw]
-    bw_lbl = (_range_label(bw[0][1], bw[-1][2]) if bw else "—")
+        # Fixed bi-weekly bucket (FY weeks paired from the start, NOT rolling).
+        b = sel_index // 2
+        bw = weeks[2 * b: 2 * b + 2]
+        bw_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in bw]
+        bw_lbl = (_range_label(bw[0][1], bw[-1][2]) if bw else "—")
 
-    # Calendar month of the selected week (by its Saturday key).
-    month_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks
-                  if (w.year, w.month) == (sel_sat.year, sel_sat.month)]
-    all_fy_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks]
+        # Calendar month of the selected week (by its Saturday key).
+        month_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks
+                      if (w.year, w.month) == (sel_sat.year, sel_sat.month)]
+        all_fy_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks]
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Team size", len(students))
-    c2.metric(f"Bi-weekly ({bw_lbl})", f"{hours_for(bw_keys):g}")
-    c3.metric(f"{sel_sat:%B} hours", f"{hours_for(month_keys):g}")
-    c4.metric(f"{pname} — FY total", f"{hours_for(all_fy_keys):g}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Team size", len(students))
+        c2.metric(f"Bi-weekly ({bw_lbl})", f"{hours_for(bw_keys):g}")
+        c3.metric(f"{sel_sat:%B} hours", f"{hours_for(month_keys):g}")
+        c4.metric(f"{pname} — FY total", f"{hours_for(all_fy_keys):g}")
 
     if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pname}"):
         def _upd(hd):
@@ -2658,6 +2650,9 @@ elif page == "Results":
 # HOURS LOGGER  (3rd account — logs weekly student hours only)
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Hours Logger":
+    if st.session_state.get("role") not in ("hours", "editor"):
+        st.error("You don't have access to this page.")
+        st.stop()
     st.title("⏱️ Weekly Hours")
     st.caption("Pick a fiscal year and project, then enter each student worker's "
                "hours for the week. Saved to the separate hours store.")
@@ -2669,6 +2664,9 @@ elif page == "Hours Logger":
 # STUDENT HOURS  (admin — assign teams, view/edit hours, totals & roll-ups)
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Student Hours":
+    if not can_edit():
+        st.error("You don't have access to this page.")
+        st.stop()
     st.title("⏱️ Student Hours Tracking")
     fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_admin")
 
