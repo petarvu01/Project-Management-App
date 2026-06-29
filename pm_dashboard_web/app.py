@@ -146,10 +146,12 @@ def _roster_cols(df):
         return None
     proj_id = pick(lambda s: "project" in s and "id" in s)
     proj = pick(lambda s: "project" in s and "id" not in s)
-    stud_id = pick(lambda s: "student" in s and "id" in s,
-                   lambda s: s == "id")
-    first = pick(lambda s: "first" in s)
-    last = pick(lambda s: "last" in s)
+    stud_id = pick(lambda s: "student" in s and ("id" in s or "#" in s or "no" in s),
+                   lambda s: s in ("id", "sid", "studentid", "student", "student#",
+                                   "student no", "student number", "student id#"),
+                   lambda s: "id" in s and "project" not in s)
+    first = pick(lambda s: "first" in s, lambda s: s in ("fname", "f name"))
+    last = pick(lambda s: "last" in s, lambda s: s in ("lname", "l name", "surname"))
     role = pick(lambda s: "role" in s, lambda s: "title" in s,
                 lambda s: "position" in s)
     return proj, proj_id, stud_id, first, last, role
@@ -162,6 +164,28 @@ def roster_df_for_fy(fy):
         if _fy_year_of(key) == target:
             return store_to_df(rec)
     return pd.DataFrame()
+
+
+def roster_diag(fy):
+    """Human-readable reason the student list is empty for a FY (for the UI)."""
+    df = roster_df_for_fy(fy)
+    if df.empty:
+        sw = D().get("student_workers", {})
+        if sw:
+            yrs = ", ".join(sorted(set(str(k) for k in sw.keys())))
+            return ("No Student Workers sheet is saved for **this** fiscal year. "
+                    f"You have sheets saved for: {yrs}. Re-select that year, or "
+                    "upload the list under the year you're viewing.")
+        return ("No Student Workers sheet found at all. Upload it on the Student "
+                "Workers tab. If you did upload it, your changes may not have saved "
+                "to the Gist — check the storage status in the sidebar.")
+    _, _, cSID, cF, cL, cR = _roster_cols(df)
+    cols = ", ".join(str(c) for c in df.columns)
+    if cSID is None:
+        return (f"A sheet exists (columns: {cols}) but no **Student ID** column "
+                "was recognized. Rename the ID column to 'Student ID'.")
+    return (f"A sheet exists (columns: {cols}) with a Student ID column, but no "
+            "rows had a Student ID value filled in.")
 
 
 def student_master_for_fy(fy):
@@ -413,8 +437,8 @@ def render_team_assignment(fy):
         st.info("No projects in this fiscal year yet — add them in Project View.")
         return
     if not master:
-        st.info("No students found for this FY. Add the student list on the "
-                "Student Workers tab (Student ID, First/Last name, Role).")
+        st.warning("No students found for this fiscal year.")
+        st.info(roster_diag(fy))
         return
     pname = st.selectbox("Project to staff", projects, key=f"assign_proj_{fy}")
     options = {}
@@ -928,6 +952,129 @@ with st.sidebar:
 page = st.session_state.page
 
 
+def project_budget_actual(proj, sel_year):
+    """(budget, actuals, no_budget) for a project in a FY (sel_year=None → all FYs).
+    Mirrors the Actual vs Budget page logic so the chart matches the table."""
+    if sel_year is not None:
+        budget = fy_budget_available(proj, sel_year)
+        scope_lines = fy_lines(proj, sel_year)
+    else:
+        budget = fy_total_budget_added(proj)
+        scope_lines = proj.get("lines", [])
+    pers = pi = trv = 0.0
+    for row in scope_lines:
+        pers += actual_personnel_cost(row)
+        pi += actual_pi_cost(row)
+        trv += line_value(row, 8)
+    return budget, pers + pi + trv, proj.get("has_budget", False)
+
+
+def render_budget_actual_chart(fy_label):
+    """Horizontal Budget-vs-Actual bar chart (x = $, y = projects), scoped to the
+    chosen FY. Scales its height to the project count and has hover tooltips."""
+    import altair as alt
+    sel_year = None
+    if fy_label and fy_label != "All":
+        try:
+            sel_year = int(fy_label.split()[1].split("-")[0])
+        except Exception:
+            sel_year = None
+
+    rows = []
+    for name, proj in D().get("project_records", {}).items():
+        if sel_year is not None and not project_in_fy(proj, fy_label):
+            continue
+        budget, actuals, no_budget = project_budget_actual(proj, sel_year)
+        if no_budget:
+            budget = 0.0
+        if budget <= 0 and actuals <= 0:
+            continue
+        rows.append({"Project": name, "Budget": budget, "Actual": actuals,
+                     "no_budget": no_budget})
+    if not rows:
+        st.info("No project budget or actual figures for this fiscal year yet.")
+        return
+
+    rows.sort(key=lambda r: max(r["Budget"], r["Actual"]), reverse=True)
+    order = [r["Project"] for r in rows]
+
+    recs = []
+    for r in rows:
+        over = (not r["no_budget"]) and r["Actual"] > r["Budget"] and r["Budget"] > 0
+        var = r["Budget"] - r["Actual"]
+        recs.append({"Project": r["Project"], "Series": "Budget",
+                     "Amount": r["Budget"], "ColorKey": "Budget", "Variance": var})
+        recs.append({"Project": r["Project"], "Series": "Actual",
+                     "Amount": r["Actual"], "Variance": var,
+                     "ColorKey": "Actual (over budget)" if over
+                     else "Actual (within budget)"})
+    df = pd.DataFrame(recs)
+
+    height = max(160, len(order) * 46)
+    chart = (
+        alt.Chart(df).mark_bar().encode(
+            y=alt.Y("Project:N", sort=order, title=None,
+                    axis=alt.Axis(labelLimit=180)),
+            x=alt.X("Amount:Q", title="$ amount", axis=alt.Axis(format="$,.0s")),
+            yOffset=alt.YOffset("Series:N"),
+            color=alt.Color(
+                "ColorKey:N",
+                scale=alt.Scale(
+                    domain=["Budget", "Actual (within budget)", "Actual (over budget)"],
+                    range=["#2a78d6", "#1baf7a", "#e34948"]),
+                legend=alt.Legend(title=None, orient="top")),
+            tooltip=[
+                alt.Tooltip("Project:N"),
+                alt.Tooltip("Series:N", title="Series"),
+                alt.Tooltip("Amount:Q", title="Amount", format="$,.0f"),
+                alt.Tooltip("Variance:Q", title="Budget − Actual", format="$,.0f"),
+            ],
+        )
+        .properties(height=height)
+    )
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("Budget vs actual line-item spend per project for the selected "
+               "fiscal year. Red = actual over budget. Hover a bar for exact "
+               "amounts and variance.")
+
+
+def render_alerts_panel():
+    """The dismissible alerts panel (admin only). Returns nothing — renders inline."""
+    if not can_edit():
+        return
+    notifs = list(get_all_notifications(D())) + hours_activity_alerts()
+
+    def _alert_sig(note):
+        return "‖".join(str(x) for x in note)
+
+    live_sigs = {_alert_sig(n) for n in notifs}
+    dismissed = D().get("dismissed_alerts", [])
+    pruned = [s for s in dismissed if s in live_sigs]
+    if pruned != dismissed:
+        D()["dismissed_alerts"] = pruned
+        dismissed = pruned
+        save()
+
+    visible = [n for n in notifs if _alert_sig(n) not in dismissed]
+    n_alerts = len(visible)
+    title = f"⚠️ Alerts ({n_alerts})" if n_alerts else "✅ Alerts (0)"
+    with st.expander(title, expanded=st.session_state.get("alerts_open", False)):
+        if visible:
+            st.caption("Press Clear to dismiss an alert. It returns automatically "
+                       "if the condition changes or recurs.")
+            for note in visible:
+                icon, cat, proj, details = note
+                a1, a2 = st.columns([0.86, 0.14])
+                a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
+                if a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
+                    D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
+                    st.session_state["alerts_open"] = True
+                    save()
+                    st.rerun()
+        else:
+            st.success("No alerts — all clear!")
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # OVERVIEW
 # ═════════════════════════════════════════════════════════════════════════
@@ -941,17 +1088,22 @@ if page == "Overview":
 
     # Fiscal-year filter (a per-session view setting — not saved/shared).
     fy_opts = kpi_fy_options(D())
-    fcol, _ = st.columns([1, 3])
-    overview_fy = fcol.selectbox(
-        "Fiscal year", fy_opts, key="overview_fy",
-        help="Scope every KPI below to one fiscal year — including the Tools KPIs, "
-             "which are scoped by each tool's active date range. 'All' shows "
-             "whole-dataset totals across every fiscal year.",
-    )
-    if overview_fy != "All":
-        st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects and Hours "
-                   "Utilization cover projects running in this fiscal year; Tools "
-                   "cover subscriptions active in it.")
+    top_l, top_r = st.columns([3, 2])
+    with top_l:
+        fcol, _ = st.columns([1, 2])
+        overview_fy = fcol.selectbox(
+            "Fiscal year", fy_opts, key="overview_fy",
+            help="Scope every KPI below to one fiscal year — including the Tools KPIs, "
+                 "which are scoped by each tool's active date range. 'All' shows "
+                 "whole-dataset totals across every fiscal year.",
+        )
+        if overview_fy != "All":
+            st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects and Hours "
+                       "Utilization cover projects running in this fiscal year; Tools "
+                       "cover subscriptions active in it.")
+    with top_r:
+        # Alerts now live top-right, above the KPI cards (admin only).
+        render_alerts_panel()
     kpi_values = compute_kpis(D(), fy=overview_fy)
 
     for start in range(0, len(selected_kpis), 4):
@@ -1021,45 +1173,8 @@ if page == "Overview":
             st.info(f"No projects with contracted hours in {overview_fy}.")
 
     with col_right:
-        notifs = get_all_notifications(D())
-        # Admin also gets alerts when the hours logger submits new hours.
-        if can_edit():
-            notifs = list(notifs) + hours_activity_alerts()
-
-        # A stable signature per alert lets us remember which ones were cleared.
-        def _alert_sig(note):
-            return "‖".join(str(x) for x in note)
-
-        live_sigs = {_alert_sig(n) for n in notifs}
-        dismissed = D().get("dismissed_alerts", [])
-        # Auto-forget dismissals whose underlying reason no longer exists, so a
-        # resolved alert is removed (and re-alerts cleanly if it ever recurs).
-        pruned = [s for s in dismissed if s in live_sigs]
-        if pruned != dismissed:
-            D()["dismissed_alerts"] = pruned
-            dismissed = pruned
-            save()
-
-        visible = [n for n in notifs if _alert_sig(n) not in dismissed]
-        n_alerts = len(visible)
-        title = f"⚠️ Alerts ({n_alerts})" if n_alerts else "✅ Alerts (0)"
-        # An expander is a dropdown that opens client-side — no rerun, so the
-        # page keeps its scroll position when the user opens it.
-        with st.expander(title, expanded=st.session_state.get("alerts_open", False)):
-            if visible:
-                st.caption("Press Clear to dismiss an alert. It returns "
-                           "automatically if the condition changes or recurs.")
-                for note in visible:
-                    icon, cat, proj, details = note
-                    a1, a2 = st.columns([0.86, 0.14])
-                    a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
-                    if can_edit() and a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
-                        D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
-                        st.session_state["alerts_open"] = True
-                        save()
-                        st.rerun()
-            else:
-                st.success("No alerts — all clear!")
+        st.subheader("Budget vs Actual")
+        render_budget_actual_chart(overview_fy)
 
 
 # ═════════════════════════════════════════════════════════════════════════
