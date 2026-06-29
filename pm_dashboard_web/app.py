@@ -1010,11 +1010,15 @@ def render_budget_actual_chart(fy_label):
                      else "Actual (within budget)"})
     df = pd.DataFrame(recs)
 
-    height = max(160, len(order) * 46)
+    # Grow vertically with the project count, with generous spacing per project
+    # so the names stay easy to read no matter how many projects there are.
+    per_project = 58            # vertical room allotted to each project row
+    height = max(200, len(order) * per_project)
     chart = (
-        alt.Chart(df).mark_bar().encode(
+        alt.Chart(df).mark_bar(cornerRadiusEnd=3).encode(
             y=alt.Y("Project:N", sort=order, title=None,
-                    axis=alt.Axis(labelLimit=180)),
+                    axis=alt.Axis(labelLimit=180, labelPadding=8),
+                    scale=alt.Scale(paddingInner=0.35, paddingOuter=0.25)),
             x=alt.X("Amount:Q", title="$ amount", axis=alt.Axis(format="$,.0s")),
             yOffset=alt.YOffset("Series:N"),
             color=alt.Color(
@@ -1031,6 +1035,7 @@ def render_budget_actual_chart(fy_label):
             ],
         )
         .properties(height=height)
+        .configure_view(stroke=None)
     )
     st.altair_chart(chart, use_container_width=True)
     st.caption("Budget vs actual line-item spend per project for the selected "
